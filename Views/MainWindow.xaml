@@ -1,0 +1,363 @@
+<Window x:Class="DGM_NT.Views.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        xmlns:local="clr-namespace:DGM_NT"
+        mc:Ignorable="d"
+        Title="DGM-NT - Digitales Geländemodell Neuer Generation" 
+        Height="900" Width="1400"
+        WindowState="Maximized"
+        Background="#F5F5F5">
+    
+    <Window.Resources>
+        <!-- Toolbar Button Style (gilt für Button UND ToggleButton) -->
+        <Style x:Key="ToolButtonStyle" TargetType="ButtonBase">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="BorderBrush" Value="Transparent"/>
+            <Setter Property="Padding" Value="8,6"/>
+            <Setter Property="Margin" Value="2,2"/>
+            <Setter Property="ToolTipService.ShowDuration" Value="5000"/>
+            <Style.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter Property="Background" Value="#E0E0E0"/>
+                    <Setter Property="BorderBrush" Value="#B0B0B0"/>
+                </Trigger>
+                <Trigger Property="IsEnabled" Value="False">
+                    <Setter Property="Opacity" Value="0.4"/>
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+        
+        <!-- Toolbar ToggleButton Style -->
+        <Style x:Key="ToolToggleButtonStyle" TargetType="ToggleButton">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="BorderBrush" Value="Transparent"/>
+            <Setter Property="Padding" Value="8,6"/>
+            <Setter Property="Margin" Value="2,2"/>
+            <Setter Property="ToolTipService.ShowDuration" Value="5000"/>
+            <Style.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter Property="Background" Value="#E0E0E0"/>
+                    <Setter Property="BorderBrush" Value="#B0B0B0"/>
+                </Trigger>
+                <Trigger Property="IsEnabled" Value="False">
+                    <Setter Property="Opacity" Value="0.4"/>
+                </Trigger>
+                <Trigger Property="IsChecked" Value="True">
+                    <Setter Property="Background" Value="#B0D0FF"/>
+                    <Setter Property="BorderBrush" Value="#0078D4"/>
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+        
+        <!-- Menu Item Style -->
+        <Style x:Key="MenuItemStyle" TargetType="MenuItem">
+            <Setter Property="Padding" Value="12,6"/>
+        </Style>
+    </Window.Resources>
+    
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>  <!-- Menü -->
+            <RowDefinition Height="Auto"/>  <!-- Toolbar -->
+            <RowDefinition Height="*"/>     <!-- Hauptbereich -->
+            <RowDefinition Height="Auto"/>  <!-- Statusbar -->
+        </Grid.RowDefinitions>
+        
+        <!-- ========== MENÜBALKEN ========== -->
+        <Menu Grid.Row="0" Background="#FAFAFA" BorderBrush="#E0E0E0" BorderThickness="0,0,0,1">
+            <!-- Datei -->
+            <MenuItem Header="_Datei" Style="{StaticResource MenuItemStyle}">
+                <MenuItem Header="Projekt _neu" x:Name="MenuProjektNeu" Click="MenuProjektNeu_Click"/>
+                <MenuItem Header="Projekt _laden" x:Name="MenuProjektLaden" Click="MenuProjektLaden_Click"/>
+                <MenuItem Header="Projekt _speichern" x:Name="MenuProjektSpeichern" Click="MenuProjektSpeichern_Click"/>
+                <Separator/>
+                <MenuItem Header="_Beenden" x:Name="MenuBeenden" Click="MenuBeenden_Click"/>
+            </MenuItem>
+            
+            <!-- Bearbeiten -->
+            <MenuItem Header="_Bearbeiten" Style="{StaticResource MenuItemStyle}">
+                <MenuItem Header="_Punkte eingeben" x:Name="MenuPunkteEingeben" Click="MenuPunkteEingeben_Click"/>
+                <MenuItem Header="Punkte _importieren" x:Name="MenuPunkteImport" Click="MenuPunkteImport_Click"/>
+                <MenuItem Header="Punkte _exportieren" x:Name="MenuPunkteExport" Click="MenuPunkteExport_Click"/>
+                <Separator/>
+                <MenuItem Header="_Koordinaten ändern" x:Name="MenuKoordinatenAendern"/>
+                <MenuItem Header="_Höhe ändern" x:Name="MenuHoeheAendern"/>
+            </MenuItem>
+            
+            <!-- Verarbeiten -->
+            <MenuItem Header="_Verarbeiten" Style="{StaticResource MenuItemStyle}">
+                <MenuItem Header="_Vermaschen (TIN)" x:Name="MenuVermaschen" Click="MenuVermaschen_Click"/>
+                <MenuItem Header="_Bruchkanten berechnen" x:Name="MenuBruchkantenBerechnen" Click="MenuBruchkantenBerechnen_Click"/>
+                <MenuItem Header="_Höhenlinien erzeugen" x:Name="MenuHoeheNlinienErzeugen" Click="MenuHoeheNlinienErzeugen_Click"/>
+                <Separator/>
+                <MenuItem Header="_Gittermodell erzeugen" x:Name="MenuGittermodellErzeugen"/>
+                <MenuItem Header="_Automatischer Ablauf" x:Name="MenuAutomatisch"/>
+            </MenuItem>
+            
+            <!-- Ansicht -->
+            <MenuItem Header="_Ansicht" Style="{StaticResource MenuItemStyle}">
+                <MenuItem Header="_Punkte" x:Name="ViewPunkte" IsCheckable="True" IsChecked="True"/>
+                <MenuItem Header="_Dreiecke" x:Name="ViewDreiecke" IsCheckable="True" Click="ViewDreiecke_Click"/>
+                <MenuItem Header="_Bruchkanten" x:Name="ViewBruchkanten" IsCheckable="True" IsChecked="True" Click="ViewBruchkanten_Click"/>
+                <MenuItem Header="_Höhenlinien" x:Name="ViewHoeheNlinien" IsCheckable="True" IsChecked="True" Click="ViewHoehenlinien_Click"/>
+                <MenuItem Header="_Umring" x:Name="ViewUmring" IsCheckable="True"/>
+                <Separator/>
+                <MenuItem Header="Zoom _größer" x:Name="ViewZoomGross" Click="BtnZoomGross_Click"/>
+                <MenuItem Header="Zoom _kleiner" x:Name="ViewZoomKlein" Click="BtnZoomKlein_Click"/>
+                <MenuItem Header="Zeige _alle" x:Name="ViewZeigeAlle" Click="BtnZeigeAlle_Click"/>
+                <MenuItem Header="_Ausschnitt" x:Name="ViewAusschnitt" Click="ViewAusschnitt_Click"/>
+            </MenuItem>
+            
+            <!-- Ausgabe -->
+            <MenuItem Header="_Ausgabe" Style="{StaticResource MenuItemStyle}">
+                <MenuItem Header="_Höhenlinienplan zeichnen" x:Name="MenuHoeheNlinienPlan" Click="MenuHoeheNlinienPlan_Click"/>
+                <MenuItem Header="_Profile zeichnen" x:Name="MenuProfileZeichnen" Click="MenuProfileZeichnen_Click"/>
+                <MenuItem Header="_Volumenberechnung" x:Name="MenuVolumen" Click="MenuVolumen_Click"/>
+                <Separator/>
+                <MenuItem Header="CAD-_Export (DXF)" x:Name="MenuCadExport"/>
+                <MenuItem Header="_Drucken" x:Name="MenuDrucken"/>
+                <MenuItem Header="WMF _erzeugen" x:Name="MenuWmfExport"/>
+            </MenuItem>
+            
+            <!-- Werkzeuge -->
+            <MenuItem Header="_Werkzeuge" Style="{StaticResource MenuItemStyle}">
+                <MenuItem Header="_Bruchkanten bearbeiten" x:Name="ToolBruchkanten"/>
+                <MenuItem Header="_Umring bearbeiten" x:Name="ToolUmring"/>
+                <MenuItem Header="Bruchkanten _zusammenfassen" x:Name="ToolBkZusammenfassen"/>
+                <Separator/>
+                <MenuItem Header="Punkt-_Diagnose" x:Name="ToolDiagnose"/>
+                <MenuItem Header="_Steigung aus DGM" x:Name="ToolSteigung"/>
+            </MenuItem>
+            
+            <!-- Hilfe -->
+            <MenuItem Header="_Hilfe" Style="{StaticResource MenuItemStyle}">
+                <MenuItem Header="_Verwenden" x:Name="HelpVerwenden"/>
+                <Separator/>
+                <MenuItem Header="_Über DGM-NT" x:Name="MenuUeber" Click="MenuUeber_Click"/>
+            </MenuItem>
+        </Menu>
+        
+        <!-- ========== TOOLBAR ========== -->
+        <ToolBarTray Grid.Row="1" Background="#F0F0F0">
+            <ToolBar Band="0" OverflowMode="AsNeeded">
+                <!-- Projekt -->
+                <Button x:Name="BtnProjektLaden" Style="{StaticResource ToolButtonStyle}" Click="BtnProjektLaden_Click" ToolTip="Projekt laden">
+                    <StackPanel Orientation="Vertical">
+                        <Image Source="/Resources/Icons/open.png" Width="24" Height="24" Stretch="Uniform"/>
+                        <TextBlock Text="Laden" FontSize="9" TextAlignment="Center" Margin="0,2,0,0"/>
+                    </StackPanel>
+                </Button>
+                <Button x:Name="BtnProjektSpeichern" Style="{StaticResource ToolButtonStyle}" Click="BtnProjektSpeichern_Click" ToolTip="Projekt speichern">
+                    <StackPanel Orientation="Vertical">
+                        <Image Source="/Resources/Icons/save.png" Width="24" Height="24" Stretch="Uniform"/>
+                        <TextBlock Text="Speichern" FontSize="9" TextAlignment="Center" Margin="0,2,0,0"/>
+                    </StackPanel>
+                </Button>
+                
+                <Separator/>
+                
+                <!-- Punkte -->
+                <Button x:Name="BtnPunkteEinlesen" Style="{StaticResource ToolButtonStyle}" Click="BtnPunkteEinlesen_Click" ToolTip="Punkte einlesen">
+                    <StackPanel Orientation="Vertical">
+                        <Image Source="/Resources/Icons/import.png" Width="24" Height="24" Stretch="Uniform"/>
+                        <TextBlock Text="Punkte" FontSize="9" TextAlignment="Center" Margin="0,2,0,0"/>
+                    </StackPanel>
+                </Button>
+                
+                <Separator/>
+                
+                <!-- Verarbeitung -->
+                <Button x:Name="BtnVermaschen" Style="{StaticResource ToolButtonStyle}" Click="BtnVermaschen_Click" ToolTip="Dreiecke vermaschen (TIN)">
+                    <StackPanel Orientation="Vertical">
+                        <Image Source="/Resources/Icons/triangulate.png" Width="24" Height="24" Stretch="Uniform"/>
+                        <TextBlock Text="Vermaschen" FontSize="9" TextAlignment="Center" Margin="0,2,0,0"/>
+                    </StackPanel>
+                </Button>
+                <Button x:Name="BtnBruchkanten" Style="{StaticResource ToolButtonStyle}" Click="BtnBruchkanten_Click" ToolTip="Bruchkanten berechnen">
+                    <StackPanel Orientation="Vertical">
+                        <Image Source="/Resources/Icons/breakline.png" Width="24" Height="24" Stretch="Uniform"/>
+                        <TextBlock Text="Bruchkanten" FontSize="9" TextAlignment="Center" Margin="0,2,0,0"/>
+                    </StackPanel>
+                </Button>
+                <Button x:Name="BtnHoeheNlinien" Style="{StaticResource ToolButtonStyle}" Click="BtnHoeheNlinien_Click" ToolTip="Höhenlinien erzeugen">
+                    <StackPanel Orientation="Vertical">
+                        <Image Source="/Resources/Icons/contour.png" Width="24" Height="24" Stretch="Uniform"/>
+                        <TextBlock Text="Höhenlinien" FontSize="9" TextAlignment="Center" Margin="0,2,0,0"/>
+                    </StackPanel>
+                </Button>
+                <Button x:Name="BtnHoeheNlinienPlan" Style="{StaticResource ToolButtonStyle}" Click="BtnHoeheNlinienPlan_Click" ToolTip="Höhenlinienplan zeichnen">
+                    <StackPanel Orientation="Vertical">
+                        <Image Source="/Resources/Icons/contourplan.png" Width="24" Height="24" Stretch="Uniform"/>
+                        <TextBlock Text="HL-Plan" FontSize="9" TextAlignment="Center" Margin="0,2,0,0"/>
+                    </StackPanel>
+                </Button>
+                
+                <Separator/>
+                
+                <!-- Ausgabe -->
+                <Button x:Name="BtnHoehePunkte" Style="{StaticResource ToolButtonStyle}" ToolTip="Höhen für Punkte">
+                    <StackPanel Orientation="Vertical">
+                        <Image Source="/Resources/Icons/height.png" Width="24" Height="24" Stretch="Uniform"/>
+                        <TextBlock Text="Höhen" FontSize="9" TextAlignment="Center" Margin="0,2,0,0"/>
+                    </StackPanel>
+                </Button>
+                <Button x:Name="BtnProfile" Style="{StaticResource ToolButtonStyle}" Click="BtnProfile_Click" ToolTip="Profile zeichnen">
+                    <StackPanel Orientation="Vertical">
+                        <Image Source="/Resources/Icons/profile.png" Width="24" Height="24" Stretch="Uniform"/>
+                        <TextBlock Text="Profile" FontSize="9" TextAlignment="Center" Margin="0,2,0,0"/>
+                    </StackPanel>
+                </Button>
+                <Button x:Name="BtnVolumen" Style="{StaticResource ToolButtonStyle}" Click="BtnVolumen_Click" ToolTip="Volumenberechnung">
+                    <StackPanel Orientation="Vertical">
+                        <Image Source="/Resources/Icons/volume.png" Width="24" Height="24" Stretch="Uniform"/>
+                        <TextBlock Text="Volumen" FontSize="9" TextAlignment="Center" Margin="0,2,0,0"/>
+                    </StackPanel>
+                </Button>
+                <Button x:Name="BtnGittermodell" Style="{StaticResource ToolButtonStyle}" ToolTip="Gittermodell">
+                    <StackPanel Orientation="Vertical">
+                        <Image Source="/Resources/Icons/grid.png" Width="24" Height="24" Stretch="Uniform"/>
+                        <TextBlock Text="Gitter" FontSize="9" TextAlignment="Center" Margin="0,2,0,0"/>
+                    </StackPanel>
+                </Button>
+                
+                <Separator/>
+                
+                <!-- Zoom -->
+                <Button x:Name="BtnZeigeAlle" Style="{StaticResource ToolButtonStyle}" Click="BtnZeigeAlle_Click" ToolTip="Alle Punkte anzeigen">
+                    <StackPanel Orientation="Vertical">
+                        <Image Source="/Resources/Icons/zoomfit.png" Width="24" Height="24" Stretch="Uniform"/>
+                        <TextBlock Text="Zeige alle" FontSize="9" TextAlignment="Center" Margin="0,2,0,0"/>
+                    </StackPanel>
+                </Button>
+                <Button x:Name="BtnAusschnitt" Style="{StaticResource ToolButtonStyle}" Click="BtnAusschnitt_Click" ToolTip="Ausschnitt wählen">
+                    <StackPanel Orientation="Vertical">
+                        <Image Source="/Resources/Icons/selection.png" Width="24" Height="24" Stretch="Uniform"/>
+                        <TextBlock Text="Ausschnitt" FontSize="9" TextAlignment="Center" Margin="0,2,0,0"/>
+                    </StackPanel>
+                </Button>
+                
+                <Separator/>
+                
+                <!-- Anzeige -->
+                <ToggleButton x:Name="BtnShowPunkte" Style="{StaticResource ToolToggleButtonStyle}" IsChecked="True" ToolTip="Punkte anzeigen">
+                    <StackPanel Orientation="Vertical">
+                        <Image Source="/Resources/Icons/showpoints.png" Width="24" Height="24" Stretch="Uniform"/>
+                        <TextBlock Text="Punkte" FontSize="9" TextAlignment="Center" Margin="0,2,0,0"/>
+                    </StackPanel>
+                </ToggleButton>
+                <ToggleButton x:Name="BtnShowDreiecke" Style="{StaticResource ToolToggleButtonStyle}" ToolTip="Dreiecke anzeigen">
+                    <StackPanel Orientation="Vertical">
+                        <Image Source="/Resources/Icons/showtriangles.png" Width="24" Height="24" Stretch="Uniform"/>
+                        <TextBlock Text="Dreiecke" FontSize="9" TextAlignment="Center" Margin="0,2,0,0"/>
+                    </StackPanel>
+                </ToggleButton>
+                <ToggleButton x:Name="BtnShowBruchkanten" Style="{StaticResource ToolToggleButtonStyle}" IsChecked="True" ToolTip="Bruchkanten anzeigen">
+                    <StackPanel Orientation="Vertical">
+                        <Image Source="/Resources/Icons/showbreaklines.png" Width="24" Height="24" Stretch="Uniform"/>
+                        <TextBlock Text="Bruchk." FontSize="9" TextAlignment="Center" Margin="0,2,0,0"/>
+                    </StackPanel>
+                </ToggleButton>
+                <ToggleButton x:Name="BtnShowHoeheNlinien" Style="{StaticResource ToolToggleButtonStyle}" IsChecked="True" ToolTip="Höhenlinien anzeigen">
+                    <StackPanel Orientation="Vertical">
+                        <Image Source="/Resources/Icons/showcontours.png" Width="24" Height="24" Stretch="Uniform"/>
+                        <TextBlock Text="Höhenl." FontSize="9" TextAlignment="Center" Margin="0,2,0,0"/>
+                    </StackPanel>
+                </ToggleButton>
+            </ToolBar>
+        </ToolBarTray>
+        
+        <!-- ========== HAUPTBEREICH ========== -->
+        <Grid Grid.Row="2">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            
+            <!-- 2D-View (Custom Drawing statt Canvas) -->
+            <Border Grid.Column="0" BorderBrush="#CCCCCC" BorderThickness="1" Margin="5" Background="White">
+                <Grid>
+                    <local:DgmDrawPanel x:Name="DrawPanel" ClipToBounds="True"/>
+                    
+                    <!-- Overlay für Informationen -->
+                    <Border Background="#CCFFFFFF" CornerRadius="4" Padding="8" 
+                            HorizontalAlignment="Right" VerticalAlignment="Top" Margin="10">
+                        <StackPanel>
+                            <TextBlock Text="Anzeige:" FontWeight="Bold" FontSize="12" Margin="0,0,0,5"/>
+                            <CheckBox x:Name="ChkPunkte" Content="Punkte" 
+                                      FontSize="11" IsChecked="True" Checked="ChkAnzeige_Changed" Unchecked="ChkAnzeige_Changed"/>
+                            <CheckBox x:Name="ChkDreiecke" Content="Dreiecksvermaschung" 
+                                      FontSize="11" Checked="ChkAnzeige_Changed" Unchecked="ChkAnzeige_Changed"/>
+                            <CheckBox x:Name="ChkBruchkanten" Content="Bruchkanten" 
+                                      FontSize="11" Checked="ChkAnzeige_Changed" Unchecked="ChkAnzeige_Changed"/>
+                            <CheckBox x:Name="ChkHoehenlinien" Content="Höhenlinien" 
+                                      FontSize="11" Checked="ChkAnzeige_Changed" Unchecked="ChkAnzeige_Changed"/>
+                            <CheckBox x:Name="ChkHoehenplan" Content="Höhenlinienplan" 
+                                      FontSize="11" Checked="ChkAnzeige_Changed" Unchecked="ChkAnzeige_Changed"/>
+                            <Separator Margin="0,5"/>
+                            <TextBlock x:Name="LblProjekt" Text="Kein Projekt" FontSize="11" FontWeight="Bold"/>
+                            <TextBlock x:Name="LblPunkte" Text="Punkte: 0" FontSize="10"/>
+                            <TextBlock x:Name="LblDreiecke" Text="Dreiecke: 0" FontSize="10"/>
+                            <TextBlock x:Name="LblZoom" Text="Zoom: 1.0x" FontSize="10"/>
+                        </StackPanel>
+                    </Border>
+                </Grid>
+            </Border>
+            
+            <!-- Rechte Seite: Dateiliste / Projektinfo -->
+            <Border Grid.Column="1" BorderBrush="#CCCCCC" BorderThickness="1,1,0,1" Margin="0,5,5,5" Width="200" Background="White">
+                <TabControl x:Name="TabControlRechts">
+                    <TabItem Header="Projekte">
+                        <ListBox x:Name="ListProjekte" BorderThickness="0" SelectionChanged="ListProjekte_SelectionChanged"/>
+                    </TabItem>
+                    <TabItem Header="Info">
+                        <StackPanel Margin="5">
+                            <TextBlock x:Name="LblInfoName" Text="Name:" FontWeight="Bold" Margin="0,5,0,0"/>
+                            <TextBlock x:Name="LblInfoWert" Text="-" Margin="5,0,0,0"/>
+                            <TextBlock x:Name="LblInfoOrt" Text="Ort:" FontWeight="Bold" Margin="0,10,0,0"/>
+                            <TextBlock x:Name="LblInfoOrtWert" Text="-" Margin="5,0,0,0"/>
+                            <TextBlock x:Name="LblInfoBearbeiter" Text="Bearbeiter:" FontWeight="Bold" Margin="0,10,0,0"/>
+                            <TextBlock x:Name="LblInfoBearbeiterWert" Text="-" Margin="5,0,0,0"/>
+                        </StackPanel>
+                    </TabItem>
+                </TabControl>
+            </Border>
+        </Grid>
+        
+        <!-- ========== STATUSBAR ========== -->
+        <StatusBar Grid.Row="3" Background="#E8E8E8" BorderBrush="#CCCCCC" BorderThickness="0,1,0,0">
+            <StatusBar.ItemsPanel>
+                <ItemsPanelTemplate>
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                    </Grid>
+                </ItemsPanelTemplate>
+            </StatusBar.ItemsPanel>
+            
+            <StatusBarItem Grid.Column="0">
+                <TextBlock x:Name="StatusProjekt" Text="Kein Projekt" FontWeight="Bold"/>
+            </StatusBarItem>
+            <StatusBarItem Grid.Column="1">
+                <TextBlock x:Name="StatusZoom" Text="Zoom: 1.0x" Margin="15,0,0,0"/>
+            </StatusBarItem>
+            <StatusBarItem Grid.Column="2">
+                <TextBlock x:Name="StatusMeldung" Text="Bereit"/>
+            </StatusBarItem>
+            <StatusBarItem Grid.Column="3">
+                <TextBlock x:Name="StatusKoordinaten" Text="X: 0.000  Y: 0.000  H: 0.000" Margin="15,0,0,0"/>
+            </StatusBarItem>
+            <StatusBarItem Grid.Column="4">
+                <TextBlock x:Name="StatusPunkte" Text="P: 0  D: 0" Margin="15,0,0,0"/>
+            </StatusBarItem>
+        </StatusBar>
+    </Grid>
+</Window>

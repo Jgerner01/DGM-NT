@@ -1,0 +1,27 @@
+## .NET
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+*.cache
+*.nuget
+*.user
+*.suo
+*.vs/
+
+## Build
+publish/
+
+## IDE
+.vscode/
+.idea/
+
+## OS
+.DS_Store
+Thumbs.db
+
+## Debug
+dgm-nt-debug.log
+*.log
+
+## Test
+test.kor
