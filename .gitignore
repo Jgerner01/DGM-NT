@@ -1,0 +1,31 @@
+# Rust-Build
+/app/target/
+target/
+
+# Sperr- und Zwischendateien
+*.lock
+!/app/Cargo.lock
+*.bak
+*.dgmnt.json
+
+# Editor/OS
+.vscode/
+Thumbs.db
+desktop.ini
+
+# lokale Build-Einstellung (fester Pfad auf dem Entwicklungsrechner)
+/app/.cargo/
+
+# Ergebnisse der Werkzeuge zur Analyse des Originals und lokale Testausgaben
+/investigation.cany/
+/capture/
+/checks/
+/inbox/
+/craft.json
+/feed.json
+/usage.json
+/build-activity.log
+/app/shots/
+
+# fertige Programmdatei (wird als Release-Datei angehängt, nicht eingecheckt)
+/dist/

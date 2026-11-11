@@ -1,0 +1,199 @@
+{
+ "version": 1,
+ "values": [
+  {
+   "name": "Abstand Höhenlinien (Vorgabe)",
+   "group": "parameter",
+   "value": 10.0,
+   "unit": "m",
+   "source": "function 0x51322c (GM0 Zeile 1)"
+  },
+  {
+   "name": "max. Dreieckseite (Vorgabe)",
+   "group": "parameter",
+   "value": 100.0,
+   "unit": "m",
+   "source": "function 0x51322c (GM0 Zeile 2)"
+  },
+  {
+   "name": "min. Dreieckswinkel (Vorgabe)",
+   "group": "parameter",
+   "value": 5.0,
+   "unit": "gon",
+   "source": "function 0x51322c (GM0 Zeile 3)"
+  },
+  {
+   "name": "Dreiecksunterteilung (Vorgabe)",
+   "group": "parameter",
+   "value": 10,
+   "source": "function 0x51322c (GM0 Zeile 4)"
+  },
+  {
+   "name": "Nachkomma Höhen",
+   "group": "parameter",
+   "value": 2,
+   "source": "function 0x51322c (GM0 Zeile 13)"
+  },
+  {
+   "name": "Nachkomma Zähllinien",
+   "group": "parameter",
+   "value": 0,
+   "source": "function 0x51322c (GM0 Zeile 14)"
+  },
+  {
+   "name": "Maßstabszahl Plott",
+   "group": "parameter",
+   "value": 1000.0,
+   "source": "function 0x51322c (GM0 Zeile 15)"
+  },
+  {
+   "name": "Rand Zeichnung",
+   "group": "parameter",
+   "value": 20.0,
+   "unit": "mm",
+   "source": "function 0x51322c (GM0 Zeile 18)"
+  },
+  {
+   "name": "Abstand Gitterkreuze",
+   "group": "parameter",
+   "value": 100.0,
+   "unit": "mm",
+   "source": "function 0x51322c (GM0 Zeile 19)"
+  },
+  {
+   "name": "Ausdünnung",
+   "group": "parameter",
+   "value": 0.05,
+   "unit": "mm",
+   "source": "function 0x51322c (GM0 Zeile 20)"
+  },
+  {
+   "name": "Mindestabstand Höhenlinienpunkte",
+   "group": "parameter",
+   "value": 2.0,
+   "unit": "mm",
+   "source": "function 0x51322c (GM0 Zeile 21)"
+  },
+  {
+   "name": "Glättung (Vorgabe)",
+   "group": "parameter",
+   "value": 0,
+   "source": "function 0x51322c (GM0 Zeile 23, '0')"
+  },
+  {
+   "name": "GM9 Trennzeichen zwischen Ringen",
+   "group": "files",
+   "value": "#",
+   "source": "function 0x50793c, string 0x507e60"
+  },
+  {
+   "name": "GM9 max. Punkte Umring",
+   "group": "files",
+   "value": 8000,
+   "source": "function 0x50793c"
+  },
+  {
+   "name": "GM9 max. Punkte je Inring",
+   "group": "files",
+   "value": 100,
+   "source": "function 0x50793c"
+  },
+  {
+   "name": "GM9 max. Anzahl Inringe",
+   "group": "files",
+   "value": 16,
+   "source": "function 0x50793c"
+  },
+  {
+   "name": "Umring Drehrichtung",
+   "group": "files",
+   "value": "Uhrzeigersinn",
+   "source": "Angabe des Anwenders"
+  },
+  {
+   "name": "Inring Drehrichtung",
+   "group": "files",
+   "value": "gegen den Uhrzeigersinn",
+   "source": "Angabe des Anwenders"
+  },
+  {
+   "name": "identische Punkte unter",
+   "group": "model",
+   "value": 0.05,
+   "unit": "m",
+   "source": "dgm.sys Zeile 14"
+  },
+  {
+   "name": "Neuer Zoom je Mausrad-Raste",
+   "group": "zoom",
+   "value": 1.25,
+   "unit": "x",
+   "estimated": true
+  },
+  {
+   "name": "Neuer Zoom Bereich min",
+   "group": "zoom",
+   "value": 0.0001,
+   "unit": "px/m",
+   "estimated": true
+  },
+  {
+   "name": "Neuer Zoom Bereich max",
+   "group": "zoom",
+   "value": 20000.0,
+   "unit": "px/m",
+   "estimated": true
+  },
+  {
+   "name": "Fangkreis",
+   "group": "controls",
+   "value": 10,
+   "unit": "px",
+   "estimated": true
+  },
+  {
+   "name": "Autospeichern Intervall",
+   "group": "autosave",
+   "value": 60,
+   "unit": "s",
+   "estimated": true
+  },
+  {
+   "name": "Rückgängig-Schritte",
+   "group": "autosave",
+   "value": 40,
+   "estimated": true
+  },
+  {
+   "name": "Zähllinie jede n-te Linie",
+   "group": "contours",
+   "value": 5,
+   "source": "Beschriftungen in da-dgm1.gms / Diplomarbeit.gms / METZKA.gms (alle 5 Linien)"
+  },
+  {
+   "name": "Beschriftungsabstand Zähllinien",
+   "group": "contours",
+   "value": 0.2,
+   "unit": "Anteil der größten Ausdehnung",
+   "source": "Angabe des Anwenders"
+  },
+  {
+   "name": "Wölbungsgrenze Kante",
+   "group": "surface",
+   "value": "0.5*|dz| + 0.05*L*min|g|, tanh-begrenzt",
+   "source": "Angabe des Anwenders (hyperbolisch, kein Übersteuern)"
+  },
+  {
+   "name": "Dämpfung Rand",
+   "group": "surface",
+   "value": 0.5,
+   "estimated": true
+  },
+  {
+   "name": "Glättung Spline-Spannung je Stufe",
+   "group": "contours",
+   "value": 0.14,
+   "estimated": true
+  }
+ ]
+}
