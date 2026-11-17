@@ -6,7 +6,7 @@ dazu stufenloser Vektor-Zoom, Autospeichern und ein Modellvergleich.
 ## Funktionen
 
 - **Dateien:** liest und schreibt die Projektdateien des Originals (GM0/GM1/GM2/GM9/GMG); Autospeichern alle 60 s
-  (`<Projekt>.dgmnt.json`), Rückgängig/Wiederholen.
+  (`<Projekt>.dgmnt.json`), Rückgängig/Wiederholen; ein- und mehrteilige GeoTIFF-Höhenraster lassen sich als GM1 exportieren.
 - **Modell:** Vermaschung mit Bruchkanten, Umring und Inringen, glatte Modellfläche ohne Überschwingen, Höhenlinien
   mit Zähllinien und Beschriftung, Höhenfarben mit Schummerung, 3D-Ansicht, Profil, Volumen über Bezugshöhe.
 - **Analyse – Modellvergleich:** zweites Modell einlesen, gemeinsamer Umring, Auftrags- und Abtragsvolumen aus

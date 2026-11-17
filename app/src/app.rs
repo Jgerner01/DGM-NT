@@ -1,8 +1,9 @@
 //! The main window: menus as in the original (Datei, Bearbeiten, Zoom, Manipulieren, Hilfe),
 //! the vector map with smooth zoom, the editing tools and autosave.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use egui::{Align2, Color32, FontId, Key, Pos2, Rect, Sense, Shape, Stroke, StrokeKind, Ui, Vec2};
@@ -11,14 +12,17 @@ use serde::{Deserialize, Serialize};
 use crate::analysis::{self, ProfilePoint, VolumeResult};
 use crate::compare::{Compare, MapMode, Tab as CmpTab};
 use crate::contours::{self, Contours};
+use crate::dxf_z;
 use crate::export::{self, Sheet};
 use crate::files;
+use crate::job::{self, Progress};
 use crate::scene;
-use crate::model::{ManualLabel, Params, Point, Polyline, Project, ProjectState};
+use crate::model::{ManualLabel, Params, Point, Polyline, Project, ProjectState, Tri, AUTO_CALC_LIMIT_POINTS, WARN_POINTS};
 use crate::render::{self, ContourStyle, FillCache, FillMode, Palette};
-use crate::tin::{self, Surface};
+use crate::tin::{self, MeshReport, Surface};
 use crate::view::{nice_step, View};
 use crate::view3d::View3d;
+use crate::water::{self, Water};
 
 // ------------------------------------------------------------------ settings
 
@@ -56,6 +60,7 @@ pub struct Layers {
     pub tri_numbers: bool,
     pub breaklines: bool,
     pub rings: bool,
+    pub water: bool,
     pub contours: bool,
     pub labels: bool,
     pub grid: bool,
@@ -75,6 +80,7 @@ impl Default for Layers {
             tri_numbers: false,
             breaklines: true,
             rings: true,
+            water: true,
             contours: true,
             labels: true,
             grid: true,
@@ -112,12 +118,15 @@ enum Tool {
     BkShow,
     RingCreate,
     RingDelete,
+    WaterCreate,
     PlanCreate,
     PlanDelete,
     HeightPick,
     Profile,
     LabelManual,
     PNrPos,
+    /// Koordinatenfenster am Bildschirm digitalisieren (zwei Eckpunkte)
+    WindowPick,
 }
 
 impl Tool {
@@ -138,12 +147,14 @@ impl Tool {
             Tool::BkShow => "Bruchkante anzeigen: Linie anklicken, das ganze Polygon blinkt.",
             Tool::RingCreate => "Ring erzeugen: Punkte anklicken, rechte Maustaste schließt. Im Uhrzeigersinn = Umring, gegen den Uhrzeigersinn = Inring.",
             Tool::RingDelete => "Umring/Inring löschen: Ringlinie anklicken.",
+            Tool::WaterCreate => "Wasserfläche erzeugen: Punkte der Wasserlinie anklicken, rechte Maustaste schließt die Fläche (mindestens 3 Punkte, bis 10 Wasserflächen).",
             Tool::PlanCreate => "Grundrisslinie: Punkte anklicken, rechte Maustaste = fertig.",
             Tool::PlanDelete => "Grundrisslinie löschen: Linie anklicken.",
             Tool::HeightPick => "Höhen für Punkte: Lage anklicken, die Höhe wird aus dem Modell gerechnet (mit Stationierung).",
             Tool::Profile => "Profil: Achspunkte anklicken, rechte Maustaste = Profil rechnen.",
             Tool::LabelManual => "Höhenlinienbeschriftung manuell: auf eine Höhenlinie klicken.",
             Tool::PNrPos => "Punktnummer-Position: Punkt anklicken, die Nummer wandert weiter.",
+            Tool::WindowPick => "Koordinatenfenster digitalisieren: 1. Ecke und 2. Ecke (diagonal gegenüber) anklicken. Rechte Maustaste oder Esc = abbrechen.",
         }
     }
 }
@@ -155,6 +166,35 @@ struct PrintState {
     /// zusätzlicher Streifen für die Legende (mm): unten bei Hochformat, rechts bei Querformat
     strip: f64,
     scale_edit: f64,
+}
+
+/// Deckkraft der Wasserflächen auf der Karte (0..255)
+const WATER_ALPHA: u8 = 215;
+
+/// Aktionen im Fenster Wasserflächen, die erst nach dem Zeichnen ausgeführt werden
+enum WaterAct {
+    Select(usize),
+    Delete(usize),
+    PullAll(Option<usize>),
+    PullOne(usize, f64),
+    RemovePoint(usize, usize),
+    SaveProtocol,
+}
+
+/// PDF-Ausgabe des Gittermodells (3D): Blattformat und Maßstab
+struct Print3dState {
+    open: bool,
+    landscape: bool,
+    /// zusätzlicher Streifen für die Legende (mm)
+    strip: f64,
+    scale_edit: f64,
+}
+
+/// Kleinster gebräuchlicher Maßstab (1:N) mit N >= `n`.
+fn standard_scale_at_least(n: f64) -> f64 {
+    let base = [1.0, 1.25, 2.0, 2.5, 5.0, 10.0];
+    let e = n.max(1.0).log10().floor();
+    base.iter().map(|b| (b * 10f64.powf(e)).round()).find(|&c| c >= n).unwrap_or(10f64.powf(e + 1.0))
 }
 
 /// DXF-Export der Bildschirmdarstellung
@@ -182,10 +222,133 @@ fn nearest_standard_scale(n: f64) -> f64 {
     best.1
 }
 
+/// Schaltflächen des Abschnitts „Koordinatenfenster“ im Parameterdialog
+enum WinAction {
+    Pick,
+    View,
+    All,
+    Save,
+}
+
+/// Analyse: DXF-Datei mit Höhen aus dem Modell versehen
+#[derive(Default)]
+struct DxfZState {
+    open: bool,
+    /// gewählte Quelldatei und ihr Inhalt
+    source: Option<(PathBuf, Vec<u8>)>,
+    /// auch Z = 0 gilt als fehlend (viele CAD-Programme schreiben für 2D-Zeichnungen Z = 0)
+    replace_zero: bool,
+    /// Ergebnis: neue Datei und Auswertung
+    result: Option<(Vec<u8>, dxf_z::ZReport)>,
+    message: String,
+}
+
 enum Confirm {
     WriteOriginal,
     Remesh,
     ReloadOriginal,
+}
+
+// ------------------------------------------------------------------ Hintergrundarbeiten
+
+/// Bis zu dieser Punktzahl wird die Vermaschung nach einer Bearbeitung sofort gerechnet; darüber läuft
+/// sie im Hintergrund mit Fortschrittsbalken.
+const SYNC_MESH_POINTS: usize = 3000;
+
+/// Höchstzahl gleichzeitig gezeichneter Punkte; bei mehr sichtbaren Punkten wird ausgedünnt.
+const MAX_DRAWN_POINTS: usize = 40_000;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LoadMode {
+    /// Projekt öffnen (Autospeicherstand oder Originaldateien)
+    Open,
+    /// Originaldateien neu einlesen (Rückgängig bleibt möglich)
+    Reload,
+}
+
+/// Geländemodell aus den Dreiecken: Fläche, Höhenlinien, Höhenfarben
+struct Model {
+    surface: Surface,
+    contours: Contours,
+    fill: Option<FillCache>,
+}
+
+struct Loaded {
+    project: Project,
+    from_auto: bool,
+    mode: LoadMode,
+    meshed: Option<MeshReport>,
+    model: Option<Model>,
+}
+
+struct Meshed {
+    triangles: Vec<Tri>,
+    report: MeshReport,
+    model: Model,
+}
+
+enum JobDone {
+    Loaded(Box<Loaded>),
+    Meshed(Box<Meshed>),
+    Converted { result: Result<usize, String>, inputs: usize, output: PathBuf },
+}
+
+struct Job {
+    title: String,
+    progress: Arc<Progress>,
+    rx: mpsc::Receiver<Result<JobDone, String>>,
+}
+
+fn build_model(pr: &Project, mode: FillMode, shade: bool) -> Model {
+    let s = Surface::new(pr, pr.st.params.subdivision > 0);
+    let mut c = contours::compute(&s, &pr.st.params);
+    let ext = pr.bbox().map(|b| (b[2] - b[0]).max(b[3] - b[1])).unwrap_or(100.0);
+    contours::place_labels(&mut c, ext, (ext * 0.012).max(0.5));
+    let fill = FillCache::build(&s, mode, shade, (pr.st.params.subdivision as usize).clamp(1, 4), (s.zmin, s.zmax));
+    Model { surface: s, contours: c, fill }
+}
+
+/// Vermaschen; von Hand gelöschte Dreiecke bleiben gelöscht.
+fn mesh_keeping_deleted(pr: &Project, progress: job::ProgressFn) -> (Vec<Tri>, MeshReport) {
+    let deleted: HashSet<[usize; 3]> = pr.st.triangles.iter().filter(|t| !t.active).map(|t| sorted(t.v)).collect();
+    let (mut tris, rep) = tin::triangulate_progress(pr, progress);
+    if !deleted.is_empty() {
+        for t in tris.iter_mut() {
+            if deleted.contains(&sorted(t.v)) {
+                t.active = false;
+            }
+        }
+    }
+    (tris, rep)
+}
+
+fn mesh_message(rep: &MeshReport) -> String {
+    format!(
+        "Vermaschung: {} Punkte, {} Dreiecke{}{}.",
+        rep.points_used,
+        rep.triangles,
+        if rep.duplicates > 0 { format!(", {} identische Punkte übergangen", rep.duplicates) } else { String::new() },
+        if rep.constraints_skipped > 0 { format!(", {} Kantenstücke nicht einarbeitbar (Kreuzung)", rep.constraints_skipped) } else { String::new() }
+    )
+}
+
+/// Projekt laden: der neuere Autospeicherstand, sonst die Originaldateien. Zweiter Wert: aus Autospeicherstand.
+fn load_project(dir: &Path, name: &str, mode: LoadMode, prog: &Progress) -> Result<(Project, bool), String> {
+    if mode == LoadMode::Open {
+        let auto = dir.join(format!("{}.dgmnt.json", name));
+        let gm1_time = files::find_ext(dir, name, "gm1").and_then(|p| p.metadata().ok()).and_then(|m| m.modified().ok());
+        let auto_time = auto.metadata().ok().and_then(|m| m.modified().ok());
+        if auto_time.is_some() && (gm1_time.is_none() || auto_time >= gm1_time) {
+            prog.set_indeterminate("Autospeicherstand einlesen");
+            let state = std::fs::read_to_string(&auto).ok().and_then(|s| serde_json::from_str::<ProjectState>(&s).ok());
+            if let Some(st) = state {
+                let mut p = Project { dir: dir.to_path_buf(), st, index: Default::default() };
+                p.rebuild_index();
+                return Ok((p, true));
+            }
+        }
+    }
+    Project::load_original_progress(dir.to_path_buf(), name, &mut |f, st| prog.set(f, st)).map(|p| (p, false))
 }
 
 // ------------------------------------------------------------------ app
@@ -223,6 +386,7 @@ pub struct DgmApp {
     /// Analyse: zweites Geländemodell, Überschneidung, Auftrag/Abtrag, Höhenunterschied
     cmp: Compare,
     print: PrintState,
+    print3d: Print3dState,
     dxf: DxfState,
     show_volume: bool,
     volume_ref: f64,
@@ -236,6 +400,14 @@ pub struct DgmApp {
     show_3d: bool,
     v3d: View3d,
     show_bklist: bool,
+    /// Fenster Wasserflächen: Tabelle und Protokoll
+    show_water: bool,
+    water_sel: usize,
+    water_tab: u8,
+    /// Bearbeitung einer Höhe läuft: der Rückgängig-Schritt ist schon angelegt
+    water_editing: bool,
+    /// Dreieckszerlegung der Wasserflächen für die Füllung (Schlüssel: Punktfolge und Koordinatensumme)
+    water_cache: std::cell::RefCell<Vec<(Vec<usize>, f64, Vec<[usize; 3]>)>>,
     show_settings: bool,
     show_help: bool,
     show_about: bool,
@@ -251,6 +423,15 @@ pub struct DgmApp {
     map_rect: Rect,
     start_zoom: Option<f64>,
     auto_export: Option<(Option<PathBuf>, Option<PathBuf>, Option<PathBuf>)>,
+    /// laufende Hintergrundarbeit (Einlesen, Vermaschen, Umwandeln) mit Fortschrittsbalken
+    job: Option<Job>,
+    /// Automatische Vermaschung/Höhenlinien sind abgeschaltet (zu viele Punkte), nur manuell möglich
+    auto_off: bool,
+    /// Hinweis- oder Warnfenster nach dem Einlesen
+    notice: Option<String>,
+    /// erste digitalisierte Ecke des Koordinatenfensters
+    win_first: Option<[f64; 2]>,
+    dxfz: DxfZState,
 }
 
 impl DgmApp {
@@ -291,6 +472,7 @@ impl DgmApp {
             dups: Vec::new(),
             cmp: Compare::default(),
             print: PrintState { open: false, landscape: true, strip: 60.0, scale_edit: 0.0 },
+            print3d: Print3dState { open: false, landscape: true, strip: 60.0, scale_edit: 0.0 },
             dxf: DxfState { open: false, scale: 0.0, fills: false },
             show_volume: false,
             volume_ref: 0.0,
@@ -304,6 +486,11 @@ impl DgmApp {
             show_3d: false,
             v3d: View3d::default(),
             show_bklist: false,
+            show_water: false,
+            water_sel: 0,
+            water_tab: 0,
+            water_editing: false,
+            water_cache: Default::default(),
             show_settings: false,
             show_help: false,
             show_about: false,
@@ -318,17 +505,22 @@ impl DgmApp {
             map_rect: Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 700.0)),
             start_zoom: zoom,
             auto_export: None,
+            job: None,
+            auto_off: false,
+            notice: None,
+            win_first: None,
+            dxfz: DxfZState { replace_zero: true, ..Default::default() },
         };
         // start: a file given on the command line, the last project, else the data folder, else a demo
         if let Some(p) = open {
             app.open_path(&p);
         }
-        if app.project.is_none() && !app.settings.last_project.is_empty() && !app.settings.data_dir.is_empty() {
+        if app.project.is_none() && app.job.is_none() && !app.settings.last_project.is_empty() && !app.settings.data_dir.is_empty() {
             let dir = PathBuf::from(&app.settings.data_dir);
             let name = app.settings.last_project.clone();
             app.open_project(dir, &name);
         }
-        if app.project.is_none() {
+        if app.project.is_none() && app.job.is_none() {
             for d in [r"C:\dgm\daten", r"C:\Programme\dgm\daten"] {
                 let dir = PathBuf::from(d);
                 let list = files::list_projects(&dir);
@@ -341,15 +533,25 @@ impl DgmApp {
                 break;
             }
         }
-        if app.project.is_none() {
-            let mut pr = Project::demo();
-            let (t, _) = tin::triangulate(&pr);
-            pr.st.triangles = t;
-            app.project = Some(pr);
-            app.recompute();
-            app.status = "Kein Datenordner gefunden – ein Beispielgelände wird gezeigt. Datei → Projekt laden…".into();
+        // Screenshot-Modus: das Projekt muss vor dem ersten Bild vollständig geladen sein
+        if app.screenshot.is_some() {
+            app.wait_job();
+        }
+        if app.project.is_none() && app.job.is_none() {
+            app.load_demo();
         }
         app
+    }
+
+    /// Beispielgelände zeigen, wenn kein Projekt geladen werden konnte.
+    fn load_demo(&mut self) {
+        let mut pr = Project::demo();
+        let (t, _) = tin::triangulate(&pr);
+        pr.st.triangles = t;
+        self.project = Some(pr);
+        self.auto_off = false;
+        self.recompute();
+        self.status = "Kein Datenordner gefunden – ein Beispielgelände wird gezeigt. Datei → Projekt laden…".into();
     }
 
     pub fn set_show_3d(&mut self, on: bool) {
@@ -374,53 +576,109 @@ impl DgmApp {
     }
 
     fn open_project(&mut self, dir: PathBuf, name: &str) {
-        if self.dirty {
+        self.start_load(dir, name, LoadMode::Open);
+    }
+
+    /// Hintergrundarbeit starten; während sie läuft sperrt ein Fortschrittsfenster die Bedienung.
+    fn spawn_job<F>(&mut self, title: &str, work: F)
+    where
+        F: FnOnce(&Progress) -> Result<JobDone, String> + Send + 'static,
+    {
+        if self.job.is_some() {
+            self.status = "Es läuft bereits eine Arbeit – bitte warten.".into();
+            return;
+        }
+        let progress = Progress::new();
+        let shared = progress.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(work(&shared));
+        });
+        self.job = Some(Job { title: title.to_string(), progress, rx });
+    }
+
+    /// Projekt einlesen (mit Fortschrittsbalken); danach wird bis zur Punktgrenze vermascht und gerechnet.
+    fn start_load(&mut self, dir: PathBuf, name: &str, mode: LoadMode) {
+        if mode == LoadMode::Open && self.dirty {
             self.autosave();
         }
-        let auto = dir.join(format!("{}.dgmnt.json", name));
-        let gm1_time = files::find_ext(&dir, name, "gm1").and_then(|p| p.metadata().ok()).and_then(|m| m.modified().ok());
-        let auto_time = auto.metadata().ok().and_then(|m| m.modified().ok());
-        let mut from_auto = false;
-        let pr = if auto_time.is_some() && (gm1_time.is_none() || auto_time >= gm1_time) {
-            match std::fs::read_to_string(&auto).ok().and_then(|s| serde_json::from_str::<ProjectState>(&s).ok()) {
-                Some(st) => {
-                    from_auto = true;
-                    let mut p = Project { dir: dir.clone(), st, index: Default::default() };
-                    p.rebuild_index();
-                    Ok(p)
-                }
-                None => Project::load_original(dir.clone(), name),
+        let name = name.to_string();
+        let auto_compute = self.settings.auto_compute;
+        let (fill_mode, shade) = (self.settings.layers.fill_mode(), self.settings.layers.shade);
+        let title = format!("Projekt {} einlesen", name);
+        self.spawn_job(&title, move |prog| {
+            let (mut pr, from_auto) = load_project(&dir, &name, mode, prog)?;
+            let n = pr.st.points.len();
+            let compute = n <= AUTO_CALC_LIMIT_POINTS && n <= pr.st.params.max_calc_points as usize;
+            let mut meshed = None;
+            if compute && pr.st.triangles.is_empty() && (auto_compute || mode == LoadMode::Reload) {
+                let (t, rep) = tin::triangulate_progress(&pr, &mut |f, st| prog.set(f, st));
+                pr.st.triangles = t;
+                meshed = Some(rep);
             }
-        } else {
-            Project::load_original(dir.clone(), name)
-        };
-        match pr {
-            Ok(mut pr) => {
-                let n = pr.st.points.len();
-                if pr.st.triangles.is_empty() && self.settings.auto_compute {
-                    let (t, _) = tin::triangulate(&pr);
-                    pr.st.triangles = t;
-                }
-                self.project = Some(pr);
-                self.undo.clear();
-                self.redo.clear();
-                self.dirty = false;
-                self.pick.clear();
-                self.tool = Tool::View;
-                self.recompute();
-                self.need_fit = true;
-                self.settings.last_project = name.to_string();
-                self.settings.data_dir = dir.display().to_string();
-                self.save_settings();
-                self.status = if from_auto {
-                    format!("Projekt {} geladen ({} Punkte) – letzter automatisch gespeicherter Stand.", name, n)
-                } else {
-                    format!("Projekt {} geladen ({} Punkte).", name, n)
-                };
-                self.last_save = Instant::now();
-            }
-            Err(e) => self.status = e,
+            let model = if compute {
+                prog.set_indeterminate("Geländemodell und Höhenlinien berechnen");
+                Some(build_model(&pr, fill_mode, shade))
+            } else {
+                None
+            };
+            Ok(JobDone::Loaded(Box::new(Loaded { project: pr, from_auto, mode, meshed, model })))
+        });
+    }
+
+    fn finish_load(&mut self, l: Loaded) {
+        let Loaded { project, from_auto, mode, meshed, model } = l;
+        let n = project.st.points.len();
+        let max = project.st.params.max_calc_points as usize;
+        let (name, dir) = (project.st.name.clone(), project.dir.clone());
+        if mode == LoadMode::Reload {
+            self.checkpoint();
         }
+        self.project = Some(project);
+        self.auto_off = n > AUTO_CALC_LIMIT_POINTS;
+        self.pick.clear();
+        match model {
+            Some(m) => self.apply_model(m),
+            None => self.clear_model(),
+        }
+        let mut status = match (mode, from_auto) {
+            (LoadMode::Open, true) => format!("Projekt {} geladen ({} Punkte) – letzter automatisch gespeicherter Stand.", name, n),
+            (LoadMode::Open, false) => format!("Projekt {} geladen ({} Punkte).", name, n),
+            (LoadMode::Reload, _) => format!("Originaldateien neu eingelesen ({} Punkte).", n),
+        };
+        if let Some(rep) = &meshed {
+            status += &format!(" {}", mesh_message(rep));
+        }
+        if mode == LoadMode::Open {
+            self.undo.clear();
+            self.redo.clear();
+            self.dirty = false;
+            self.tool = Tool::View;
+            self.need_fit = true;
+            self.settings.last_project = name;
+            self.settings.data_dir = dir.display().to_string();
+            self.save_settings();
+            self.last_save = Instant::now();
+        }
+        // Grenzen für Automatik, Warnung und Rechengrenze
+        let mut lines: Vec<String> = Vec::new();
+        if n > max {
+            status += &format!(" Berechnungen abgeschaltet (mehr als {} Punkte).", max);
+            lines.push(format!("{} Punkte eingelesen – das sind mehr als die Rechengrenze von {} Punkten (Parameter).", n, max));
+            lines.push("Vermaschung, Höhenlinien und alle weiteren Berechnungen sind abgeschaltet.".into());
+            lines.push("Mit dem Koordinatenfenster (Parameter) einen Teil ausschneiden und als GM1-Datei speichern, oder die Rechengrenze erhöhen.".into());
+        } else if n > WARN_POINTS {
+            status += " Automatische Vermaschung und Höhenlinien sind abgeschaltet.";
+            lines.push(format!("{} Punkte eingelesen – mehr als {} Punkte.", n, WARN_POINTS));
+            lines.push("Vermaschung und Höhenlinien können sehr lange dauern und viel Speicher brauchen.".into());
+            lines.push("Sie werden nicht automatisch gerechnet: Bearbeiten → Vermaschen startet sie von Hand. Besser vorher mit dem Koordinatenfenster (Parameter) einen Teil ausschneiden.".into());
+        } else if self.auto_off {
+            status += &format!(" Mehr als {} Punkte: Vermaschung und Höhenlinien nicht automatisch – Bearbeiten → Vermaschen.", AUTO_CALC_LIMIT_POINTS);
+        }
+        if !lines.is_empty() {
+            self.notice = Some(lines.join("\n"));
+        }
+        self.status = status;
     }
 
     /// Modell so einpassen, dass es die Zeichenfläche des Blatts füllt.
@@ -441,6 +699,7 @@ impl DgmApp {
 
     /// Startoption `--print`: Druckvorschau öffnen (Screenshot-Test).
     pub fn start_print(&mut self, portrait: bool) {
+        self.wait_job();
         self.print.landscape = !portrait;
         self.print.strip = if portrait { 45.0 } else { 60.0 };
         self.print.open = true;
@@ -448,13 +707,22 @@ impl DgmApp {
 
     /// Startoptionen für Tests: Dateien ohne Dialog schreiben (`--export-pdf`, `--export-dxf`, `--export-gm1`).
     pub fn start_exports(&mut self, pdf: Option<PathBuf>, dxf: Option<PathBuf>, gm1: Option<PathBuf>, portrait: bool) {
+        self.wait_job();
         self.print.landscape = !portrait;
         self.print.strip = if portrait { 45.0 } else { 60.0 };
         self.auto_export = Some((pdf, dxf, gm1));
     }
 
+    /// Startoption `--mesh`: nach dem Laden von Hand vermaschen und Höhenlinien rechnen (Test).
+    pub fn start_mesh(&mut self) {
+        self.wait_job();
+        self.remesh_manual();
+        self.wait_job();
+    }
+
     /// Startoption `--second`: zweites Modell ohne Dialog laden und die Analyse zeigen.
     pub fn start_analysis(&mut self, second: &Path, tab: Option<&str>) {
+        self.wait_job();
         let Some(pr) = &self.project else { return };
         let params = pr.st.params.clone();
         match self.cmp.load(second, &params) {
@@ -479,6 +747,10 @@ impl DgmApp {
             self.status = "Zuerst ein Projekt laden.".into();
             return;
         };
+        if self.calc_blocked() {
+            self.status = self.blocked_text();
+            return;
+        }
         let params = pr.st.params.clone();
         let mut dlg = rfd::FileDialog::new().add_filter("Punktdatei", &["gm1", "GM1"]).set_title("Zweites Geländemodell (gm1) einlesen");
         if !self.settings.data_dir.is_empty() && Path::new(&self.settings.data_dir).is_dir() {
@@ -643,6 +915,377 @@ impl DgmApp {
         };
     }
 
+    /// Blatt der 3D-Ausgabe.
+    fn sheet3d(&self) -> Sheet {
+        let mut s = Sheet::new(self.print3d.landscape);
+        s.strip = self.print3d.strip;
+        s
+    }
+
+    /// Vektorbasierte PDF-Datei des Gittermodells in der aktuellen Ansicht.
+    fn export_pdf_3d(&mut self, path: &Path, zr: (f64, f64)) {
+        let sheet = self.sheet3d();
+        let Some(n) = self.v3d.print_n(&sheet) else {
+            self.status = "PDF-Fehler: noch kein Gittermodell vorhanden.".into();
+            return;
+        };
+        let Some(name) = self.project.as_ref().map(|p| p.st.name.clone()) else { return };
+        let quads = self.v3d.quads(zr);
+        let info = export::Model3dInfo {
+            step: self.v3d.grid.as_ref().map_or(0.0, |g| g.step),
+            exaggeration: self.v3d.exaggeration as f64,
+            azimuth_deg: (self.v3d.azimuth as f64).to_degrees(),
+            elevation_deg: (self.v3d.elevation as f64).to_degrees(),
+            zr,
+            shaded: self.v3d.shaded,
+            water: (!self.v3d.waters.is_empty()).then(|| (self.v3d.water_rgb, self.v3d.waters.len())),
+        };
+        let legend = export::legend_3d(&info);
+        let bytes = export::render_pdf_3d(&quads, self.v3d.pan, self.v3d.wire, &legend, self.v3d.north_dir(), &sheet, n, &name);
+        self.status = match std::fs::write(path, bytes) {
+            Ok(_) => format!("PDF geschrieben: {} (Gittermodell, A4 {}, 1:{})", path.display(), if self.print3d.landscape { "quer" } else { "hoch" }, group_thousands(n.round() as u64)),
+            Err(e) => format!("PDF-Fehler: {}", e),
+        };
+    }
+
+    fn print3d_dialog(&mut self, ctx: &egui::Context, zr: (f64, f64)) {
+        if !self.print3d.open {
+            return;
+        }
+        let mut open = true;
+        let mut do_pdf = false;
+        let sheet = self.sheet3d();
+        let n_now = self.v3d.print_n(&sheet);
+        if self.print3d.scale_edit <= 0.0 {
+            self.print3d.scale_edit = nearest_standard_scale(n_now.unwrap_or(1000.0));
+        }
+        let mut set_scale = false;
+        let mut standard = false;
+        let mut fit = false;
+        egui::Window::new("Gittermodell – PDF").open(&mut open).default_width(330.0).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Blatt A4:");
+                ui.radio_value(&mut self.print3d.landscape, false, "Hochformat");
+                ui.radio_value(&mut self.print3d.landscape, true, "Querformat");
+            });
+            ui.horizontal(|ui| {
+                ui.label(if self.print3d.landscape { "Legendenstreifen rechts (mm):" } else { "Legendenstreifen unten (mm):" });
+                ui.add(egui::DragValue::new(&mut self.print3d.strip).speed(1.0).range(25.0..=120.0));
+            });
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label("Maßstab jetzt:");
+                ui.strong(n_now.map_or("–".to_string(), |n| format!("1:{}", group_thousands(n.round().max(1.0) as u64))));
+            });
+            ui.horizontal(|ui| {
+                ui.label("Maßstab 1:");
+                ui.add(egui::DragValue::new(&mut self.print3d.scale_edit).speed(10.0).range(1.0..=10_000_000.0));
+                if ui.button("setzen").clicked() {
+                    set_scale = true;
+                }
+                if ui.button("Normmaßstab").on_hover_text("nächster gebräuchlicher Maßstab (z. B. 1:500, 1:1000)").clicked() {
+                    standard = true;
+                }
+            });
+            if ui.button("Modell auf das Blatt einpassen").clicked() {
+                fit = true;
+            }
+            ui.separator();
+            ui.weak("Ansicht drehen (ziehen), zoomen (Mausrad) und verschieben (rechte Maustaste). Gedruckt wird der Bereich im schwarzen Rahmen als Vektorgrafik; dazu Legende, Maßstab und Nordpfeil. Der Maßstab gilt waagrecht in Bildrichtung.");
+            ui.add_space(4.0);
+            if ui.add_sized([ui.available_width(), 30.0], egui::Button::new("PDF erzeugen…")).clicked() {
+                do_pdf = true;
+            }
+        });
+        if standard {
+            self.print3d.scale_edit = nearest_standard_scale(n_now.unwrap_or(1000.0));
+            set_scale = true;
+        }
+        if set_scale && self.print3d.scale_edit >= 1.0 {
+            self.v3d.set_print_n(&sheet, self.print3d.scale_edit);
+        }
+        if fit {
+            self.v3d.fit_print(&sheet, zr, standard_scale_at_least);
+            self.print3d.scale_edit = self.v3d.print_n(&sheet).unwrap_or(self.print3d.scale_edit).round();
+        }
+        if do_pdf {
+            let name = self.project.as_ref().map(|p| p.st.name.clone()).unwrap_or_default();
+            let mut dlg = rfd::FileDialog::new().add_filter("PDF", &["pdf"]).set_file_name(format!("{}_3D.pdf", name));
+            if !self.settings.data_dir.is_empty() && Path::new(&self.settings.data_dir).is_dir() {
+                dlg = dlg.set_directory(&self.settings.data_dir);
+            }
+            if let Some(p) = dlg.save_file() {
+                self.export_pdf_3d(&p, zr);
+            }
+        }
+        self.print3d.open = open;
+    }
+
+    /// Wasserflächen mit Ausgleichungsebene für das Gittermodell übernehmen (nur bei eingeschalteter Ebene).
+    fn sync_waters_3d(&mut self) {
+        self.v3d.waters.clear();
+        let Some(pr) = &self.project else { return };
+        self.v3d.water_rgb = pr.st.params.water_rgb;
+        if !self.settings.layers.water {
+            return;
+        }
+        for w in &pr.st.waters {
+            if w.pts.iter().any(|&i| i >= pr.st.points.len()) {
+                continue;
+            }
+            if let Some(plane) = water::analyze(&pr.st.points, w).fit {
+                self.v3d.waters.push(crate::view3d::WaterShape { poly: w.pts.iter().map(|&i| (pr.st.points[i].x, pr.st.points[i].y)).collect(), plane });
+            }
+        }
+    }
+
+    /// Fenster Wasserflächen: Liste, editierbare Punkttabelle, Ausreißer auf die Ebene ziehen, Protokoll.
+    fn water_window(&mut self, ctx: &egui::Context) {
+        if !self.show_water {
+            return;
+        }
+        let Some(pr) = &self.project else {
+            self.show_water = false;
+            return;
+        };
+        let waters_before = pr.st.waters.clone();
+        let mut waters = waters_before.clone();
+        let reports: Vec<water::WaterReport> = waters.iter().map(|w| water::analyze(&pr.st.points, w)).collect();
+        let protocol = water::protocol(&pr.st.points, &waters);
+        self.water_sel = self.water_sel.min(waters.len().saturating_sub(1));
+        let sel = self.water_sel;
+        // Zeilen der gewählten Wasserfläche: (Punktindex, Name, x, y, z, Ebenenhöhe, Abweichung, Ausreißer)
+        let rows: Vec<(usize, usize, String, f64, f64, f64, f64, f64, bool)> = match (waters.get(sel), reports.get(sel)) {
+            (Some(w), Some(r)) => {
+                let valid: Vec<(usize, usize)> = w.pts.iter().enumerate().filter(|(_, &i)| i < pr.st.points.len()).map(|(pos, &i)| (pos, i)).collect();
+                valid.iter().enumerate().map(|(k, &(pos, i))| {
+                    let p = &pr.st.points[i];
+                    let (pz, dz, out) = r.rows.get(k).map_or((f64::NAN, 0.0, false), |q| (q.plane_z, q.dz, q.outlier));
+                    (pos, i, p.name.clone(), p.x, p.y, p.z, pz, dz, out)
+                }).collect()
+            }
+            _ => Vec::new(),
+        };
+        let total_out: usize = reports.iter().map(|r| r.outliers).sum();
+        let mut open = true;
+        let mut act: Option<WaterAct> = None;
+        let mut new_tool = false;
+        let mut z_edits: Vec<(usize, f64)> = Vec::new();
+        let mut edit_done = false;
+        egui::Window::new("Wasserflächen").open(&mut open).default_size([700.0, 540.0]).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if ui.add_enabled(waters.len() < water::MAX_WATERS, egui::Button::new("Neue Wasserfläche…")).on_hover_text("Punkte anklicken, rechte Maustaste schließt").clicked() {
+                    new_tool = true;
+                }
+                ui.label(format!("{} von {} Wasserflächen", waters.len(), water::MAX_WATERS));
+                ui.separator();
+                ui.selectable_value(&mut self.water_tab, 0, "Tabelle");
+                ui.selectable_value(&mut self.water_tab, 1, "Protokoll");
+            });
+            if total_out > 0 {
+                ui.colored_label(Color32::from_rgb(200, 90, 0), format!("WARNUNG: {} Punkt(e) weichen mehr als {:.0} cm von der vermittelnden Ebene ab.", total_out, water::WATER_TOL_M * 100.0));
+                if ui.button("Alle Ausreißer auf die Ebene ziehen").clicked() {
+                    act = Some(WaterAct::PullAll(None));
+                }
+            }
+            ui.separator();
+            if self.water_tab == 1 {
+                ui.horizontal(|ui| {
+                    if ui.button("Als Textdatei speichern…").clicked() {
+                        act = Some(WaterAct::SaveProtocol);
+                    }
+                    if ui.button("Kopieren").clicked() {
+                        ui.ctx().copy_text(protocol.clone());
+                    }
+                });
+                egui::ScrollArea::both().show(ui, |ui| {
+                    let mut text = protocol.as_str();
+                    ui.add(egui::TextEdit::multiline(&mut text).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY));
+                });
+                return;
+            }
+            egui::Grid::new("water_list").striped(true).show(ui, |ui| {
+                for h in ["Nr", "Name", "Punkte", "z Ebene [m]", "Neigung [%]", "Fließrichtung [gon]", "max. |dz| [cm]", "", ""] {
+                    ui.strong(h);
+                }
+                ui.end_row();
+                for (k, w) in waters.iter_mut().enumerate() {
+                    let rep = &reports[k];
+                    if ui.selectable_label(sel == k, format!("{}", k + 1)).clicked() {
+                        act = Some(WaterAct::Select(k));
+                    }
+                    ui.add(egui::TextEdit::singleline(&mut w.name).desired_width(130.0));
+                    ui.label(format!("{}", w.pts.len()));
+                    match rep.fit {
+                        Some(f) => {
+                            ui.monospace(format!("{:.3}", f.z0));
+                            ui.monospace(format!("{:.4}", f.slope_percent()));
+                            ui.monospace(f.flow_gon().map_or("–".to_string(), |g| format!("{:.1}", g)));
+                            let txt = format!("{:.1}", rep.max_abs * 100.0);
+                            if rep.outliers > 0 {
+                                ui.colored_label(Color32::from_rgb(200, 0, 0), format!("{} ({} Ausreißer)", txt, rep.outliers));
+                            } else {
+                                ui.monospace(txt);
+                            }
+                        }
+                        None => {
+                            ui.label("keine Ebene");
+                            ui.label("");
+                            ui.label("");
+                            ui.label("");
+                        }
+                    }
+                    ui.add_enabled_ui(rep.outliers > 0, |ui| {
+                        if ui.button("Ausreißer ziehen").on_hover_text("Höhen der Ausreißer auf die vermittelnde Ebene setzen").clicked() {
+                            act = Some(WaterAct::PullAll(Some(k)));
+                        }
+                    });
+                    if ui.button("Löschen").clicked() {
+                        act = Some(WaterAct::Delete(k));
+                    }
+                    ui.end_row();
+                }
+            });
+            ui.separator();
+            if let Some(w) = waters.get(sel) {
+                ui.strong(format!("Punkte von „{}“ – Höhen sind editierbar", w.name));
+                let can_remove = w.pts.len() > water::MIN_WATER_POINTS;
+                egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                    egui::Grid::new("water_points").striped(true).show(ui, |ui| {
+                        for h in ["Nr", "Punkt", "x [m]", "y [m]", "z [m]", "z Ebene [m]", "dz [cm]", "", ""] {
+                            ui.strong(h);
+                        }
+                        ui.end_row();
+                        for (k, &(pos, i, ref name, x, y, z, pz, dz, out)) in rows.iter().enumerate() {
+                            ui.label(format!("{}", k + 1));
+                            ui.label(name);
+                            ui.monospace(format!("{:.3}", x));
+                            ui.monospace(format!("{:.3}", y));
+                            let mut zz = z;
+                            let resp = ui.add(egui::DragValue::new(&mut zz).speed(0.005).fixed_decimals(3));
+                            if resp.changed() {
+                                z_edits.push((i, zz));
+                            }
+                            if resp.drag_stopped() || resp.lost_focus() {
+                                edit_done = true;
+                            }
+                            ui.monospace(if pz.is_nan() { "–".to_string() } else { format!("{:.3}", pz) });
+                            let t = format!("{:+.1}", dz * 100.0);
+                            if out {
+                                ui.colored_label(Color32::from_rgb(200, 0, 0), format!("{}  !", t));
+                            } else {
+                                ui.monospace(t);
+                            }
+                            ui.add_enabled_ui(!pz.is_nan() && dz.abs() > 0.0005, |ui| {
+                                if ui.button("→ Ebene").on_hover_text("Höhe auf die vermittelnde Ebene setzen").clicked() {
+                                    act = Some(WaterAct::PullOne(i, (pz * 1000.0).round() / 1000.0));
+                                }
+                            });
+                            ui.add_enabled_ui(can_remove, |ui| {
+                                if ui.button("entfernen").on_hover_text("Punkt aus dieser Wasserfläche nehmen (der Punkt bleibt im Modell)").clicked() {
+                                    act = Some(WaterAct::RemovePoint(sel, pos));
+                                }
+                            });
+                            ui.end_row();
+                        }
+                    });
+                });
+                ui.weak("Die Höhe eines Punktes gilt im ganzen Modell. Nach dem Ziehen wird die Ebene neu ausgeglichen; weitere Ausreißer können dadurch sichtbar werden.");
+            } else {
+                ui.label("Noch keine Wasserfläche. Manipulieren → Wasserflächen → erzeugen.");
+            }
+        });
+        if !open {
+            self.show_water = false;
+        }
+        if new_tool {
+            self.settings.layers.water = true;
+            self.set_tool(Tool::WaterCreate);
+        }
+        // Namen übernehmen
+        let renamed = waters.iter().zip(&waters_before).any(|(a, b)| a.name != b.name);
+        if renamed {
+            if let Some(pr) = self.project.as_mut() {
+                for (w, n) in pr.st.waters.iter_mut().zip(&waters) {
+                    w.name = n.name.clone();
+                }
+            }
+            self.dirty = true;
+        }
+        // Höhen editiert: ein Rückgängig-Schritt je Bearbeitung, Neuberechnung erst am Ende
+        if !z_edits.is_empty() {
+            if !self.water_editing {
+                self.checkpoint();
+                self.water_editing = true;
+            }
+            if let Some(pr) = self.project.as_mut() {
+                for (i, z) in z_edits {
+                    pr.st.points[i].z = z;
+                }
+            }
+        }
+        if edit_done {
+            self.water_editing = false;
+            self.recompute();
+        }
+        match act {
+            Some(WaterAct::Select(k)) => self.water_sel = k,
+            Some(WaterAct::Delete(k)) => {
+                self.checkpoint();
+                if let Some(pr) = self.project.as_mut() {
+                    pr.st.waters.remove(k);
+                }
+                self.status = "Wasserfläche gelöscht.".into();
+            }
+            Some(WaterAct::RemovePoint(k, pos)) => {
+                self.checkpoint();
+                if let Some(pr) = self.project.as_mut() {
+                    pr.st.waters[k].pts.remove(pos);
+                }
+            }
+            Some(WaterAct::PullOne(i, z)) => {
+                self.checkpoint();
+                if let Some(pr) = self.project.as_mut() {
+                    pr.st.points[i].z = z;
+                }
+                self.recompute();
+                self.status = "Höhe auf die vermittelnde Ebene gesetzt.".into();
+            }
+            Some(WaterAct::PullAll(which)) => {
+                let mut changes: Vec<(usize, f64)> = Vec::new();
+                for (k, rep) in reports.iter().enumerate() {
+                    if which.map_or(true, |w| w == k) {
+                        changes.extend(rep.rows.iter().filter(|r| r.outlier).map(|r| (r.idx, (r.plane_z * 1000.0).round() / 1000.0)));
+                    }
+                }
+                if !changes.is_empty() {
+                    self.checkpoint();
+                    if let Some(pr) = self.project.as_mut() {
+                        for &(i, z) in &changes {
+                            pr.st.points[i].z = z;
+                        }
+                    }
+                    self.recompute();
+                    self.status = format!("{} Ausreißer auf die vermittelnde Ebene gezogen.", changes.len());
+                }
+            }
+            Some(WaterAct::SaveProtocol) => {
+                let name = self.project.as_ref().map(|p| p.st.name.clone()).unwrap_or_default();
+                let mut dlg = rfd::FileDialog::new().add_filter("Text", &["txt"]).set_file_name(format!("{}_Wasserflaechen.txt", name));
+                if !self.settings.data_dir.is_empty() && Path::new(&self.settings.data_dir).is_dir() {
+                    dlg = dlg.set_directory(&self.settings.data_dir);
+                }
+                if let Some(p) = dlg.save_file() {
+                    self.status = match files::write_text(&p, &protocol) {
+                        Ok(_) => format!("Protokoll gespeichert: {}", p.display()),
+                        Err(e) => format!("Fehler beim Speichern: {}", e),
+                    };
+                }
+            }
+            None => {}
+        }
+    }
+
     fn print_dialog(&mut self, ctx: &egui::Context) {
         if !self.print.open {
             return;
@@ -751,6 +1394,7 @@ impl DgmApp {
                     ui.checkbox(&mut l.triangles, "Dreiecke");
                     ui.checkbox(&mut l.breaklines, "Bruchkanten");
                     ui.checkbox(&mut l.rings, "Umring");
+                    ui.checkbox(&mut l.water, "Wasserflächen");
                     ui.checkbox(&mut l.plan, "Grundriss");
                 });
                 if !l.points {
@@ -916,43 +1560,359 @@ impl DgmApp {
         }
     }
 
-    /// Vermaschen (keeps triangles the person deleted by hand deleted).
-    fn remesh(&mut self) {
-        let Some(pr) = &mut self.project else { return };
-        let deleted: Vec<[usize; 3]> = pr.st.triangles.iter().filter(|t| !t.active).map(|t| sorted(t.v)).collect();
-        let (mut tris, rep) = tin::triangulate(pr);
-        for t in tris.iter_mut() {
-            if deleted.contains(&sorted(t.v)) {
-                t.active = false;
-            }
-        }
-        pr.st.triangles = tris;
-        self.status = format!(
-            "Vermaschung: {} Punkte, {} Dreiecke{}{}.",
-            rep.points_used,
-            rep.triangles,
-            if rep.duplicates > 0 { format!(", {} identische Punkte übergangen", rep.duplicates) } else { String::new() },
-            if rep.constraints_skipped > 0 { format!(", {} Kantenstücke nicht einarbeitbar (Kreuzung)", rep.constraints_skipped) } else { String::new() }
-        );
-        self.recompute();
+    /// Mehr Punkte als die Rechengrenze (Parameter): alle weiteren Berechnungen sind abgeschaltet.
+    fn calc_blocked(&self) -> bool {
+        self.project.as_ref().map_or(false, |p| p.st.points.len() > p.st.params.max_calc_points as usize)
     }
 
-    /// Model + contours + fill from the current triangles.
-    fn recompute(&mut self) {
-        let Some(pr) = &self.project else { return };
-        let s = Surface::new(pr, pr.st.params.subdivision > 0);
-        let mut c = contours::compute(&s, &pr.st.params);
-        let ext = pr.bbox().map(|b| (b[2] - b[0]).max(b[3] - b[1])).unwrap_or(100.0);
-        contours::place_labels(&mut c, ext, (ext * 0.012).max(0.5));
-        let zr = (s.zmin, s.zmax);
-        self.fill = FillCache::build(&s, self.settings.layers.fill_mode(), self.settings.layers.shade, (pr.st.params.subdivision as usize).clamp(1, 4), zr);
-        self.contours = Some(c);
-        self.surface = Some(s);
+    fn blocked_text(&self) -> String {
+        let (n, max) = self.project.as_ref().map_or((0, 0), |p| (p.st.points.len(), p.st.params.max_calc_points));
+        format!("{} Punkte: mehr als die Rechengrenze von {} Punkten – Berechnungen abgeschaltet (Rechengrenze in den Parametern, oder Ausschnitt mit Koordinatenfenster speichern).", n, max)
+    }
+
+    /// Automatisches Vermaschen nach einer Bearbeitung; bei zu vielen Punkten nur Hinweis.
+    fn remesh(&mut self) {
+        if self.project.is_none() {
+            return;
+        }
+        if self.calc_blocked() {
+            self.clear_model();
+            self.status = self.blocked_text();
+        } else if self.auto_off {
+            self.status = format!("Mehr als {} Punkte: automatische Vermaschung aus – Bearbeiten → Vermaschen.", AUTO_CALC_LIMIT_POINTS);
+        } else {
+            self.remesh_now();
+        }
+    }
+
+    /// Vermaschen auf ausdrücklichen Wunsch (Menü): schaltet die Automatik wieder ein.
+    fn remesh_manual(&mut self) {
+        if self.calc_blocked() {
+            self.clear_model();
+            self.status = self.blocked_text();
+            return;
+        }
+        self.auto_off = false;
+        self.remesh_now();
+    }
+
+    /// Vermaschen und Höhenlinien rechnen (keeps triangles the person deleted by hand deleted).
+    /// Große Punktmengen laufen im Hintergrund mit Fortschrittsbalken.
+    fn remesh_now(&mut self) {
+        let (fill_mode, shade) = (self.settings.layers.fill_mode(), self.settings.layers.shade);
+        let Some(pr) = &mut self.project else { return };
+        if pr.st.points.len() <= SYNC_MESH_POINTS {
+            let (tris, rep) = mesh_keeping_deleted(pr, &mut |_, _| {});
+            pr.st.triangles = tris;
+            self.status = mesh_message(&rep);
+            self.recompute();
+            return;
+        }
+        let mut snapshot = Project { dir: pr.dir.clone(), st: pr.st.clone(), index: Default::default() };
+        self.spawn_job("Vermaschen", move |prog| {
+            let (tris, rep) = mesh_keeping_deleted(&snapshot, &mut |f, st| prog.set(f, st));
+            snapshot.st.triangles = tris;
+            prog.set_indeterminate("Geländemodell und Höhenlinien berechnen");
+            let model = build_model(&snapshot, fill_mode, shade);
+            Ok(JobDone::Meshed(Box::new(Meshed { triangles: snapshot.st.triangles, report: rep, model })))
+        });
+    }
+
+    fn finish_mesh(&mut self, m: Meshed) {
+        let Meshed { triangles, report, model } = m;
+        if let Some(pr) = &mut self.project {
+            pr.st.triangles = triangles;
+        }
+        self.apply_model(model);
+        self.status = mesh_message(&report);
+    }
+
+    fn apply_model(&mut self, m: Model) {
+        let zmin = m.surface.zmin;
+        self.fill = m.fill;
+        self.contours = Some(m.contours);
+        self.surface = Some(m.surface);
         self.surf_id += 1;
         self.volume_res = None;
         if self.volume_ref == 0.0 {
-            self.volume_ref = zr.0.floor();
+            self.volume_ref = zmin.floor();
         }
+    }
+
+    fn clear_model(&mut self) {
+        self.fill = None;
+        self.contours = None;
+        self.surface = None;
+        self.surf_id += 1;
+        self.volume_res = None;
+    }
+
+    /// Model + contours + fill from the current triangles (nicht bei abgeschalteter Automatik/Rechengrenze).
+    fn recompute(&mut self) {
+        let Some(pr) = &self.project else { return };
+        if self.calc_blocked() {
+            self.clear_model();
+            return;
+        }
+        if self.auto_off {
+            return;
+        }
+        let m = build_model(pr, self.settings.layers.fill_mode(), self.settings.layers.shade);
+        self.apply_model(m);
+    }
+
+    // -------------------------------------------------------------- Hintergrundarbeit: Abfrage und Fenster
+
+    fn handle_job_result(&mut self, res: Result<JobDone, String>) {
+        match res {
+            Ok(JobDone::Loaded(l)) => self.finish_load(*l),
+            Ok(JobDone::Meshed(m)) => self.finish_mesh(*m),
+            Ok(JobDone::Converted { result, inputs, output }) => {
+                self.status = match result {
+                    Ok(count) => {
+                        let mut s = format!(
+                            "{} GEO-TIFF{}: {} Punkte nach {} geschrieben.",
+                            inputs,
+                            if inputs == 1 { "" } else { "s" },
+                            count,
+                            output.display()
+                        );
+                        if count > WARN_POINTS {
+                            s += &format!(" Warnung: mehr als {} Punkte – beim Einlesen sind Vermaschung und Höhenlinien nicht automatisch; besser einen Ausschnitt wählen.", WARN_POINTS);
+                        }
+                        s
+                    }
+                    Err(e) => format!("GEO-TIFF-Import fehlgeschlagen: {}", e),
+                };
+            }
+            Err(e) => {
+                if self.project.is_none() {
+                    self.load_demo();
+                }
+                self.status = e;
+            }
+        }
+    }
+
+    /// Ergebnis einer fertigen Hintergrundarbeit übernehmen; sonst weiter auf Fortschritt warten.
+    fn poll_job(&mut self, ctx: &egui::Context) {
+        let Some(job) = &self.job else { return };
+        match job.rx.try_recv() {
+            Ok(res) => {
+                self.job = None;
+                self.handle_job_result(res);
+            }
+            Err(mpsc::TryRecvError::Empty) => ctx.request_repaint_after(Duration::from_millis(50)),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.job = None;
+                self.handle_job_result(Err("Die Arbeit wurde unerwartet abgebrochen.".into()));
+            }
+        }
+    }
+
+    /// Auf eine laufende Hintergrundarbeit warten (Testmodus und Startoptionen).
+    fn wait_job(&mut self) {
+        if let Some(job) = self.job.take() {
+            let res = job.rx.recv().unwrap_or_else(|_| Err("Die Arbeit wurde unerwartet abgebrochen.".into()));
+            self.handle_job_result(res);
+        }
+    }
+
+    /// Fortschrittsfenster: sperrt die Bedienung, solange eine Hintergrundarbeit läuft.
+    fn job_window(&mut self, ctx: &egui::Context) {
+        let Some(job) = &self.job else { return };
+        egui::Modal::new(egui::Id::new("job_modal")).show(ctx, |ui| {
+            ui.set_width(420.0);
+            ui.heading(&job.title);
+            ui.add_space(6.0);
+            ui.label(job.progress.stage());
+            match job.progress.fraction() {
+                Some(f) => {
+                    ui.add(egui::ProgressBar::new(f).show_percentage());
+                }
+                None => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("bitte warten …");
+                    });
+                }
+            }
+        });
+    }
+
+    /// Hinweis-/Warnfenster (z. B. mehr als 50000 Punkte eingelesen).
+    fn notice_window(&mut self, ctx: &egui::Context) {
+        let Some(text) = &self.notice else { return };
+        let mut close = false;
+        egui::Window::new("Warnung").collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
+            ui.set_max_width(480.0);
+            ui.label(text);
+            ui.add_space(6.0);
+            if ui.button("OK").clicked() {
+                close = true;
+            }
+        });
+        if close {
+            self.notice = None;
+        }
+    }
+
+    // -------------------------------------------------------------- Koordinatenfenster (Ausschnitt)
+
+    /// Koordinatenfenster am Bildschirm digitalisieren; die Werte erscheinen in der Parametermaske.
+    fn start_window_pick(&mut self) {
+        let Some(pr) = &self.project else { return };
+        if !self.show_params {
+            self.params_edit = pr.st.params.clone();
+            self.show_params = true;
+        }
+        self.set_tool(Tool::WindowPick);
+        self.win_first = None;
+    }
+
+    // -------------------------------------------------------------- Analyse: DXF mit Höhen
+
+    /// Quelldatei wählen und einlesen.
+    fn dxfz_choose(&mut self) {
+        let mut dlg = rfd::FileDialog::new().add_filter("DXF", &["dxf", "DXF"]).set_title("DXF-Datei ohne Höhen wählen");
+        if !self.settings.data_dir.is_empty() && Path::new(&self.settings.data_dir).is_dir() {
+            dlg = dlg.set_directory(&self.settings.data_dir);
+        }
+        let Some(path) = dlg.pick_file() else { return };
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                self.dxfz.source = Some((path, bytes));
+                self.dxfz_compute();
+            }
+            Err(e) => {
+                self.dxfz.source = None;
+                self.dxfz.result = None;
+                self.dxfz.message = format!("Datei nicht lesbar: {}", e);
+            }
+        }
+    }
+
+    /// Höhen aus dem Dreiecksmodell (lineare Interpolation) eintragen.
+    fn dxfz_compute(&mut self) {
+        self.dxfz.result = None;
+        let Some((_, bytes)) = &self.dxfz.source else { return };
+        let tin = self.project.as_ref().filter(|_| !self.calc_blocked()).and_then(dxf_z::Tin::from_project);
+        let Some(tin) = tin else {
+            self.dxfz.message = "Kein Geländemodell: zuerst Dreiecke bilden (Bearbeiten → Vermaschen).".into();
+            return;
+        };
+        match dxf_z::add_heights(bytes, &tin, self.dxfz.replace_zero) {
+            Ok((out, rep)) => {
+                self.dxfz.message = rep.summary();
+                self.dxfz.result = Some((out, rep));
+            }
+            Err(e) => self.dxfz.message = e,
+        }
+    }
+
+    fn dxfz_save(&mut self) {
+        let (Some((src, _)), Some((bytes, rep))) = (&self.dxfz.source, &self.dxfz.result) else { return };
+        let stem = src.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "zeichnung".into());
+        let mut dlg = rfd::FileDialog::new().add_filter("DXF", &["dxf"]).set_file_name(format!("{}-Z.dxf", stem));
+        if let Some(d) = src.parent() {
+            dlg = dlg.set_directory(d);
+        }
+        let Some(path) = dlg.save_file() else { return };
+        let same = path == *src || matches!((path.canonicalize(), src.canonicalize()), (Ok(a), Ok(b)) if a == b);
+        if same {
+            self.dxfz.message = "Die Originaldatei wird nicht überschrieben – bitte anderen Dateinamen wählen.".into();
+            return;
+        }
+        self.dxfz.message = match std::fs::write(&path, bytes) {
+            Ok(_) => {
+                self.status = format!("DXF mit Höhen gespeichert: {} ({} Elemente mit Höhen).", path.display(), rep.changed);
+                format!("Gespeichert: {}", path.display())
+            }
+            Err(e) => format!("Speichern fehlgeschlagen: {}", e),
+        };
+    }
+
+    fn dxfz_window(&mut self, ctx: &egui::Context) {
+        if !self.dxfz.open {
+            return;
+        }
+        let mut open = true;
+        let (mut choose, mut recompute, mut save) = (false, false, false);
+        egui::Window::new("DXF-Datei mit Höhen versehen").open(&mut open).default_width(460.0).show(ctx, |ui| {
+            ui.label("Punkte ohne Z-Koordinate erhalten ihre Höhe durch lineare Interpolation im Dreiecksmodell des geladenen Projekts (gleiches Koordinatensystem vorausgesetzt).");
+            ui.add_space(4.0);
+            if ui.button("DXF-Datei wählen…").clicked() {
+                choose = true;
+            }
+            if let Some((p, b)) = &self.dxfz.source {
+                ui.label(format!("{}  ({} KB)", p.display(), b.len() / 1024));
+            }
+            if ui.checkbox(&mut self.dxfz.replace_zero, "auch Punkte mit Z = 0 neu berechnen").on_hover_text("Viele CAD-Programme schreiben für 2D-Zeichnungen ausdrücklich Z = 0").changed() {
+                recompute = true;
+            }
+            ui.separator();
+            if !self.dxfz.message.is_empty() {
+                ui.label(&self.dxfz.message);
+            }
+            if let Some((_, rep)) = &self.dxfz.result {
+                if rep.outside > 0 {
+                    ui.weak("Elemente mit Punkten außerhalb des Modells bleiben unverändert.");
+                }
+            }
+            ui.add_enabled_ui(self.dxfz.result.is_some(), |ui| {
+                if ui.button("Verbesserte DXF-Datei speichern…").clicked() {
+                    save = true;
+                }
+            });
+        });
+        self.dxfz.open = open;
+        if choose {
+            self.dxfz_choose();
+        }
+        if recompute {
+            self.dxfz_compute();
+        }
+        if save {
+            self.dxfz_save();
+        }
+    }
+
+    /// Punkte im Koordinatenfenster als neue GM1-Datei speichern.
+    fn save_window_gm1(&mut self) {
+        let Some(pr) = &self.project else { return };
+        let w = self.params_edit.win;
+        let (x0, x1, y0, y1) = (w[0].min(w[2]), w[0].max(w[2]), w[1].min(w[3]), w[1].max(w[3]));
+        if !(x1 > x0 && y1 > y0) {
+            self.status = "Koordinatenfenster ungültig: die beiden Ecken müssen verschiedene Rechts- und Hochwerte haben.".into();
+            return;
+        }
+        let inside = |p: &&Point| p.active && p.x >= x0 && p.x <= x1 && p.y >= y0 && p.y <= y1;
+        let count = pr.st.points.iter().filter(inside).count();
+        if count == 0 {
+            self.status = "Im Koordinatenfenster liegen keine (aktiven) Punkte.".into();
+            return;
+        }
+        let mut dlg = rfd::FileDialog::new()
+            .add_filter("GM1-Punktdatei", &["gm1"])
+            .set_title("Ausschnitt als GM1 speichern")
+            .set_file_name(format!("{}-Ausschnitt.gm1", pr.st.name))
+            .set_directory(&pr.dir);
+        if !pr.dir.is_dir() {
+            dlg = rfd::FileDialog::new().add_filter("GM1-Punktdatei", &["gm1"]).set_file_name(format!("{}-Ausschnitt.gm1", pr.st.name));
+        }
+        let Some(path) = dlg.save_file() else { return };
+        // die geladene Punktdatei darf nicht durch den Ausschnitt überschrieben werden
+        let same = files::find_ext(&pr.dir, &pr.st.name, "gm1")
+            .map_or(false, |g| g == path || matches!((g.canonicalize(), path.canonicalize()), (Ok(a), Ok(b)) if a == b));
+        if same {
+            self.status = "Der Ausschnitt darf nicht die geladene Punktdatei überschreiben – anderen Dateinamen wählen.".into();
+            return;
+        }
+        let (sxy, sh) = (pr.st.params.scale_xy, pr.st.params.scale_h);
+        self.status = match files::write_gm1_points(&path, pr.st.points.iter().filter(inside), sxy, sh) {
+            Ok(n) => format!("Ausschnitt: {} von {} Punkten nach {} geschrieben (Datei → Punktdatei öffnen).", n, pr.st.points.len(), path.display()),
+            Err(e) => format!("GM1-Fehler: {}", e),
+        };
     }
 
     fn rebuild_fill(&mut self) {
@@ -1034,6 +1994,20 @@ impl DgmApp {
         }
         match self.tool {
             Tool::View | Tool::ZoomRect => {}
+            Tool::WindowPick => match self.win_first.take() {
+                None => {
+                    self.win_first = Some([w.0, w.1]);
+                    self.status = format!("Fenster: 1. Ecke R {:.3}  H {:.3} – jetzt die gegenüberliegende Ecke anklicken.", w.0, w.1);
+                }
+                Some(a) => {
+                    self.params_edit.win = [a[0].min(w.0), a[1].min(w.1), a[0].max(w.0), a[1].max(w.1)];
+                    self.set_tool(Tool::View);
+                    self.status = format!(
+                        "Koordinatenfenster: R {:.3} – {:.3}, H {:.3} – {:.3} (in der Maske „Parameter“ eingetragen).",
+                        self.params_edit.win[0], self.params_edit.win[2], self.params_edit.win[1], self.params_edit.win[3]
+                    );
+                }
+            },
             Tool::PtToggle => {
                 if let Some(i) = self.nearest_point(w, false) {
                     self.checkpoint();
@@ -1096,7 +2070,7 @@ impl DgmApp {
                     }
                 }
             }
-            Tool::BkCreate { .. } | Tool::RingCreate | Tool::PlanCreate => {
+            Tool::BkCreate { .. } | Tool::RingCreate | Tool::WaterCreate | Tool::PlanCreate => {
                 if let Some(i) = self.nearest_point(w, true) {
                     if self.pick.last() != Some(&i) {
                         self.pick.push(i);
@@ -1219,6 +2193,28 @@ impl DgmApp {
                 self.remesh();
                 self.status = msg.into();
             }
+            Tool::WaterCreate if self.pick.len() >= water::MIN_WATER_POINTS => {
+                let pts = std::mem::take(&mut self.pick);
+                let count = self.project.as_ref().map_or(0, |p| p.st.waters.len());
+                if count >= water::MAX_WATERS {
+                    self.status = format!("Es sind höchstens {} Wasserflächen möglich.", water::MAX_WATERS);
+                    return;
+                }
+                self.checkpoint();
+                let pr = self.project.as_mut().unwrap();
+                let w = Water { name: format!("Wasserfläche {}", count + 1), pts };
+                let rep = water::analyze(&pr.st.points, &w);
+                pr.st.waters.push(w);
+                self.water_sel = count;
+                self.show_water = true;
+                self.status = if rep.fit.is_none() {
+                    "Wasserfläche gespeichert, aber keine Ebene möglich (Punkte liegen auf einer Geraden).".into()
+                } else if rep.outliers > 0 {
+                    format!("Wasserfläche gespeichert. WARNUNG: {} Punkt(e) weichen mehr als {:.0} cm von der Ebene ab – siehe Fenster Wasserflächen.", rep.outliers, water::WATER_TOL_M * 100.0)
+                } else {
+                    format!("Wasserfläche gespeichert (größte Abweichung von der Ebene {:.1} cm).", rep.max_abs * 100.0)
+                };
+            }
             Tool::PlanCreate if self.pick.len() >= 2 => {
                 self.checkpoint();
                 let pts = std::mem::take(&mut self.pick);
@@ -1301,6 +2297,7 @@ impl DgmApp {
 
     fn set_tool(&mut self, t: Tool) {
         self.tool = t;
+        self.win_first = None;
         self.pick.clear();
         self.pick_world.clear();
         self.status = t.hint().to_string();
@@ -1421,6 +2418,10 @@ impl DgmApp {
                         self.open_path(&p);
                     }
                 }
+                if ui.button("GEO-TIFF in GM1 umwandeln…").clicked() {
+                    ui.close();
+                    self.geotiff_to_gm1();
+                }
                 ui.separator();
                 if ui.button("Parameter…").clicked() {
                     if let Some(pr) = &self.project {
@@ -1512,7 +2513,7 @@ impl DgmApp {
                 }
                 if ui.button("Automatischer Ablauf").clicked() {
                     self.checkpoint();
-                    self.remesh();
+                    self.remesh_manual();
                     ui.close();
                 }
                 ui.separator();
@@ -1621,6 +2622,18 @@ impl DgmApp {
                         ui.close();
                     }
                 });
+                ui.menu_button("Wasserflächen", |ui| {
+                    let n = self.project.as_ref().map_or(0, |p| p.st.waters.len());
+                    if ui.add_enabled(self.project.is_some() && n < water::MAX_WATERS, egui::Button::new(format!("erzeugen ({} von {})", n, water::MAX_WATERS))).on_hover_text("Punkte anklicken, rechte Maustaste schließt die Fläche").clicked() {
+                        self.settings.layers.water = true;
+                        self.set_tool(Tool::WaterCreate);
+                        ui.close();
+                    }
+                    if ui.add_enabled(self.project.is_some(), egui::Button::new("Tabelle und Protokoll…")).clicked() {
+                        self.show_water = true;
+                        ui.close();
+                    }
+                });
                 ui.menu_button("Grundriss", |ui| {
                     if ui.button("erzeugen").clicked() {
                         self.set_tool(Tool::PlanCreate);
@@ -1647,6 +2660,10 @@ impl DgmApp {
                     self.set_tool(Tool::PNrPos);
                     ui.close();
                 }
+                if ui.button("Koordinatenfenster digitalisieren / Ausschnitt speichern…").clicked() {
+                    self.start_window_pick();
+                    ui.close();
+                }
                 if ui.button("gm1 auf identische Punkte prüfen…").clicked() {
                     self.find_dups();
                     self.show_dups = true;
@@ -1661,6 +2678,10 @@ impl DgmApp {
                 if ui.button("Zweites Geländemodell einlesen…").clicked() {
                     ui.close();
                     self.load_second();
+                }
+                if ui.button("DXF-Datei mit Höhen aus dem Modell versehen…").clicked() {
+                    self.dxfz.open = true;
+                    ui.close();
                 }
                 ui.separator();
                 let loaded = self.cmp.is_loaded();
@@ -1717,11 +2738,55 @@ impl DgmApp {
         });
     }
 
+    fn geotiff_to_gm1(&mut self) {
+        let mut dlg = rfd::FileDialog::new()
+            .add_filter("GeoTIFF", &["tif", "tiff", "geotiff", "TIF", "TIFF", "GEOTIFF"])
+            .set_title("Ein oder mehrere GEO-TIFFs auswählen");
+        if !self.settings.data_dir.is_empty() && Path::new(&self.settings.data_dir).is_dir() {
+            dlg = dlg.set_directory(&self.settings.data_dir);
+        }
+        let Some(inputs) = dlg.pick_files() else {
+            return;
+        };
+        if inputs.is_empty() {
+            return;
+        }
+
+        let first_stem = inputs[0]
+            .file_stem()
+            .map(|s| s.to_string_lossy())
+            .unwrap_or_default();
+        let default_name = if inputs.len() == 1 {
+            format!("{}.gm1", first_stem)
+        } else {
+            format!("{}-Kacheln.gm1", first_stem)
+        };
+        let mut save_dlg = rfd::FileDialog::new()
+            .add_filter("GM1-Punktdatei", &["gm1"])
+            .set_file_name(default_name);
+        if let Some(parent) = inputs[0].parent() {
+            save_dlg = save_dlg.set_directory(parent);
+        }
+        let Some(output) = save_dlg.save_file() else {
+            return;
+        };
+
+        let count = inputs.len();
+        self.spawn_job("GEO-TIFF in GM1 umwandeln", move |prog| {
+            let result = crate::geotiff::write_gm1(&inputs, &output, &mut |f, st| prog.set(f, st)).map_err(|e| e.to_string());
+            Ok(JobDone::Converted { result, inputs: count, output })
+        });
+    }
+
     fn file_stem(&self) -> String {
         self.project.as_ref().map(|p| p.st.name.clone()).unwrap_or_else(|| "dgm".into())
     }
 
     fn hull_ring(&mut self) {
+        if self.calc_blocked() {
+            self.status = self.blocked_text();
+            return;
+        }
         let Some(pr) = &self.project else { return };
         let mut idx: Vec<usize> = (0..pr.st.points.len()).filter(|&i| pr.st.points[i].active).collect();
         let pts = &pr.st.points;
@@ -1755,6 +2820,10 @@ impl DgmApp {
 
     fn find_dups(&mut self) {
         self.dups.clear();
+        if self.calc_blocked() {
+            self.status = self.blocked_text();
+            return;
+        }
         let Some(pr) = &self.project else { return };
         let mut order: Vec<usize> = (0..pr.st.points.len()).collect();
         let p = &pr.st.points;
@@ -1867,6 +2936,7 @@ impl DgmApp {
             });
             ui.checkbox(&mut l.breaklines, "Bruchkanten");
             ui.checkbox(&mut l.rings, "Umring / Inringe");
+            ui.checkbox(&mut l.water, "Wasserflächen");
             ui.checkbox(&mut l.plan, "Grundriss");
             ui.checkbox(&mut l.grid, "Koordinatengitter");
             ui.checkbox(&mut l.minimap, "Übersichtskarte");
@@ -1876,7 +2946,7 @@ impl DgmApp {
             ui.separator();
             ui.strong("Werkzeug");
             ui.label(egui::RichText::new(self.tool.hint()).small());
-            if matches!(self.tool, Tool::BkCreate { .. } | Tool::RingCreate | Tool::PlanCreate | Tool::TriCreate) && !self.pick.is_empty() {
+            if matches!(self.tool, Tool::BkCreate { .. } | Tool::RingCreate | Tool::WaterCreate | Tool::PlanCreate | Tool::TriCreate) && !self.pick.is_empty() {
                 ui.label(format!("{} Punkte gewählt", self.pick.len()));
                 ui.horizontal(|ui| {
                     if ui.button("Fertig").clicked() {
@@ -2037,6 +3107,25 @@ impl DgmApp {
                 painter.rect_stroke(r, 0.0, Stroke::new(1.5, Color32::from_rgb(40, 110, 220)), StrokeKind::Inside);
             }
         }
+        // Koordinatenfenster (Ausschnitt): eingetragenes Rechteck und erste digitalisierte Ecke
+        if self.show_params || self.tool == Tool::WindowPick {
+            let w = self.params_edit.win;
+            let win_col = Color32::from_rgb(200, 0, 120);
+            if w[2] > w[0] && w[3] > w[1] {
+                let r = Rect::from_two_pos(self.view.to_screen(rect, w[0], w[3]), self.view.to_screen(rect, w[2], w[1]));
+                painter.rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(200, 0, 120, 22));
+                painter.rect_stroke(r, 0.0, Stroke::new(2.0, win_col), StrokeKind::Middle);
+            }
+            if let Some(a) = self.win_first {
+                let pa = self.view.to_screen(rect, a[0], a[1]);
+                painter.circle_stroke(pa, 6.0, Stroke::new(2.0, win_col));
+                if let Some(h) = resp.hover_pos() {
+                    let r = Rect::from_two_pos(pa, h);
+                    painter.rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(200, 0, 120, 22));
+                    painter.rect_stroke(r, 0.0, Stroke::new(1.5, win_col), StrokeKind::Middle);
+                }
+            }
+        }
         if let Some(pr) = &self.project {
             let sp = |i: usize| self.view.to_screen(rect, pr.st.points[i].x, pr.st.points[i].y);
             let pick_col = Color32::from_rgb(230, 80, 0);
@@ -2048,7 +3137,7 @@ impl DgmApp {
                 painter.circle_stroke(sp(i), 6.0, Stroke::new(2.0, pick_col));
             }
             if let (Some(&last), Some(h)) = (self.pick.last(), resp.hover_pos()) {
-                if matches!(self.tool, Tool::BkCreate { .. } | Tool::RingCreate | Tool::PlanCreate) {
+                if matches!(self.tool, Tool::BkCreate { .. } | Tool::RingCreate | Tool::WaterCreate | Tool::PlanCreate) {
                     painter.extend(Shape::dashed_line(&[sp(last), h], Stroke::new(1.5, pick_col), 6.0, 4.0));
                 }
             }
@@ -2060,7 +3149,7 @@ impl DgmApp {
                 painter.add(Shape::line(pts, Stroke::new(2.5, Color32::from_rgb(200, 0, 120))));
             }
             // highlight the point that would be caught
-            if !matches!(self.tool, Tool::View | Tool::ZoomRect | Tool::HeightPick | Tool::Profile | Tool::LabelManual | Tool::TriToggle | Tool::TriFlip) {
+            if !matches!(self.tool, Tool::View | Tool::ZoomRect | Tool::WindowPick | Tool::HeightPick | Tool::Profile | Tool::LabelManual | Tool::TriToggle | Tool::TriFlip) {
                 if let Some(w) = self.hover {
                     if let Some(i) = self.nearest_point(w, !matches!(self.tool, Tool::PtToggle | Tool::PNrPos)) {
                         painter.circle_stroke(sp(i), 9.0, Stroke::new(1.5, Color32::from_rgb(0, 120, 255)));
@@ -2083,6 +3172,38 @@ impl DgmApp {
                 _ => egui::CursorIcon::Crosshair,
             };
             ui.ctx().set_cursor_icon(icon);
+        }
+    }
+
+    /// Wasserflächen: Farbfüllung (Parameter), Umriss und Name.
+    fn draw_waters(&self, painter: &egui::Painter, rect: Rect) {
+        let Some(pr) = &self.project else { return };
+        let c = pr.st.params.water_rgb;
+        let fill = Color32::from_rgba_unmultiplied(c[0], c[1], c[2], WATER_ALPHA);
+        let edge = Color32::from_rgb(c[0] / 2, c[1] / 2, c[2] / 2);
+        let mut cache = self.water_cache.borrow_mut();
+        let keys: Vec<(Vec<usize>, f64)> = pr.st.waters.iter().map(|w| (w.pts.clone(), w.pts.iter().filter_map(|&i| pr.st.points.get(i)).map(|p| p.x + p.y).sum())).collect();
+        if cache.len() != keys.len() || cache.iter().zip(&keys).any(|(a, b)| a.0 != b.0 || a.1 != b.1) {
+            *cache = pr.st.waters.iter().zip(keys).map(|(w, (pts, sum))| {
+                let xy: Vec<(f64, f64)> = w.pts.iter().filter_map(|&i| pr.st.points.get(i)).map(|p| (p.x, p.y)).collect();
+                (pts, sum, if xy.len() == w.pts.len() { water::triangulate(&xy) } else { Vec::new() })
+            }).collect();
+        }
+        for (k, w) in pr.st.waters.iter().enumerate() {
+            let Some(tris) = cache.get(k).map(|c| &c.2) else { continue };
+            let Some(sp) = w.pts.iter().map(|&i| pr.st.points.get(i).map(|p| self.view.to_screen(rect, p.x, p.y))).collect::<Option<Vec<Pos2>>>() else { continue };
+            let mut mesh = egui::Mesh::default();
+            for &q in &sp {
+                mesh.colored_vertex(q, fill);
+            }
+            for t in tris {
+                mesh.add_triangle(t[0] as u32, t[1] as u32, t[2] as u32);
+            }
+            painter.add(Shape::mesh(mesh));
+            let selected = self.show_water && self.water_sel == k;
+            painter.add(Shape::closed_line(sp.clone(), Stroke::new(if selected { 3.0 } else { 1.5 }, if selected { Color32::from_rgb(0, 90, 200) } else { edge })));
+            let mid = sp.iter().fold(Vec2::ZERO, |a, q| a + q.to_vec2()) / sp.len() as f32;
+            painter.text(mid.to_pos2(), Align2::CENTER_CENTER, &w.name, FontId::proportional(12.0), edge);
         }
     }
 
@@ -2202,6 +3323,9 @@ impl DgmApp {
                 }
             }
         }
+        if l.water {
+            self.draw_waters(painter, rect);
+        }
         // rings
         if l.rings {
             let stroke = Stroke::new(2.0, pal.ring);
@@ -2257,8 +3381,15 @@ impl DgmApp {
             let sym = (spacing * 0.09).clamp(1.0, 3.0) as f32;
             let show_text = spacing > 34.0;
             let dec = pr.st.params.decimals_h as usize;
+            // bei sehr vielen sichtbaren Punkten nur jeden n-ten zeichnen (sonst sprengt die Grafikliste den Puffer)
+            let thin = count_vis.div_ceil(MAX_DRAWN_POINTS).max(1);
+            let mut seen = 0usize;
             for p in &pr.st.points {
                 if !in_view(p.x, p.y) {
+                    continue;
+                }
+                seen += 1;
+                if thin > 1 && (seen - 1) % thin != 0 {
                     continue;
                 }
                 let sp = v.to_screen(rect, p.x, p.y);
@@ -2439,6 +3570,7 @@ impl DgmApp {
         if self.show_params {
             let mut open = true;
             let mut apply = false;
+            let mut win_action: Option<WinAction> = None;
             egui::Window::new("DGM Parameter / Höhenlinien").open(&mut open).default_width(360.0).show(ctx, |ui| {
                 let p = &mut self.params_edit;
                 egui::Grid::new("params").num_columns(2).striped(true).show(ui, |ui| {
@@ -2494,6 +3626,50 @@ impl DgmApp {
                     ui.label("Auflockerung Auftrag (Faktor)");
                     ui.add(egui::DragValue::new(&mut p.loosen_fill).speed(0.01).range(0.5..=3.0).fixed_decimals(2));
                     ui.end_row();
+                    ui.label("Rechengrenze (Punkte)");
+                    ui.add(egui::DragValue::new(&mut p.max_calc_points).speed(1000.0).range(1000..=100_000_000))
+                        .on_hover_text("Bei mehr Punkten sind Vermaschung, Höhenlinien und weitere Berechnungen abgeschaltet.");
+                    ui.end_row();
+                });
+                egui::CollapsingHeader::new("Koordinatenfenster (Ausschnitt)").default_open(true).show(ui, |ui| {
+                    egui::Grid::new("params_window").num_columns(2).striped(true).show(ui, |ui| {
+                        for (i, label) in ["Rechtswert links unten", "Hochwert links unten", "Rechtswert rechts oben", "Hochwert rechts oben"].iter().enumerate() {
+                            ui.label(*label);
+                            ui.add(egui::DragValue::new(&mut p.win[i]).speed(1.0).fixed_decimals(3));
+                            ui.end_row();
+                        }
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Am Bildschirm digitalisieren").on_hover_text("Zwei gegenüberliegende Ecken im Plan anklicken").clicked() {
+                            win_action = Some(WinAction::Pick);
+                        }
+                        if ui.button("Aus Bildschirmausschnitt").clicked() {
+                            win_action = Some(WinAction::View);
+                        }
+                        if ui.button("Ganzes Modell").clicked() {
+                            win_action = Some(WinAction::All);
+                        }
+                    });
+                    if ui.button("Ausschnitt als GM1 speichern…").on_hover_text("Alle aktiven Punkte im Fenster in eine neue Punktdatei schreiben").clicked() {
+                        win_action = Some(WinAction::Save);
+                    }
+                });
+                egui::CollapsingHeader::new("Gittermodell (3D)").default_open(false).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Maschenweite (m, 0 = automatisch)");
+                        ui.add(egui::DragValue::new(&mut p.mesh_width_3d).speed(0.01).range(0.0..=10000.0).max_decimals(3));
+                    });
+                    ui.weak("Kleinster Wert 0,05 m. Bei sehr großen Gebieten wird die Maschenweite so vergröbert, dass höchstens eine Million Rasterfelder entstehen.");
+                });
+                egui::CollapsingHeader::new("Wasserfläche").default_open(false).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Farbe der Wasserflächen");
+                        ui.color_edit_button_srgb(&mut p.water_rgb);
+                        if ui.button("helles Cyan").on_hover_text("Standardfarbe wiederherstellen").clicked() {
+                            p.water_rgb = water::DEFAULT_WATER_RGB;
+                        }
+                    });
+                    ui.weak("Gilt für die Karte, PDF und DXF. Gespeichert in der Projektdatei (.dgmnt.json).");
                 });
                 egui::CollapsingHeader::new("Export DXF / PDF (Schriften, Kreise, Farben)").default_open(false).show(ui, |ui| {
                     egui::Grid::new("params_export").num_columns(2).striped(true).show(ui, |ui| {
@@ -2532,6 +3708,20 @@ impl DgmApp {
                     apply = true;
                 }
             });
+            match win_action {
+                Some(WinAction::Pick) => self.start_window_pick(),
+                Some(WinAction::View) => {
+                    let v = self.view.world_rect(self.map_rect);
+                    self.params_edit.win = [v[0], v[1], v[2], v[3]];
+                }
+                Some(WinAction::All) => {
+                    if let Some(b) = self.project.as_ref().and_then(|p| p.bbox()) {
+                        self.params_edit.win = b;
+                    }
+                }
+                Some(WinAction::Save) => self.save_window_gm1(),
+                None => {}
+            }
             if apply && self.project.is_some() {
                 self.checkpoint();
                 let pr = self.project.as_mut().unwrap();
@@ -2539,12 +3729,21 @@ impl DgmApp {
                     || pr.st.params.min_angle_gon != self.params_edit.min_angle_gon
                     || pr.st.params.use_breaklines != self.params_edit.use_breaklines;
                 pr.st.params = self.params_edit.clone();
+                if pr.st.params.mesh_width_3d > 0.0 {
+                    pr.st.params.mesh_width_3d = pr.st.params.mesh_width_3d.max(crate::view3d::MESH_WIDTH_MIN);
+                }
                 if remesh {
                     self.remesh();
                 } else {
                     self.recompute();
                 }
-                self.status = "Parameter übernommen.".into();
+                self.status = if self.calc_blocked() {
+                    self.blocked_text()
+                } else if self.auto_off {
+                    format!("Parameter übernommen. Mehr als {} Punkte: Vermaschung und Höhenlinien von Hand starten (Bearbeiten → Vermaschen).", AUTO_CALC_LIMIT_POINTS)
+                } else {
+                    "Parameter übernommen.".into()
+                };
                 open = false;
             }
             self.show_params = open;
@@ -2734,6 +3933,12 @@ impl DgmApp {
         if self.show_3d {
             let mut open = true;
             let area = self.project.as_ref().and_then(|p| p.bbox());
+            // Maschenweite aus den Parametern übernehmen (0 = automatisch)
+            let mw_param = self.project.as_ref().map_or(0.0, |p| p.st.params.mesh_width_3d);
+            if mw_param > 0.0 && (self.v3d.mesh_width - mw_param).abs() > 1e-12 {
+                self.v3d.mesh_width = mw_param.max(crate::view3d::MESH_WIDTH_MIN);
+                self.v3d.grid = None;
+            }
             if let (Some(s), Some(a)) = (&self.surface, area) {
                 self.v3d.build(s, a, self.surf_id);
             }
@@ -2742,22 +3947,35 @@ impl DgmApp {
                 ui.horizontal(|ui| {
                     ui.add(egui::Slider::new(&mut self.v3d.exaggeration, 0.5..=10.0).text("Überhöhung"));
                     let mut mw = self.v3d.mesh_width;
-                    if ui.add(egui::DragValue::new(&mut mw).speed(0.5).range(0.1..=10000.0).prefix("Maschenweite ").suffix(" m")).changed() {
+                    if ui.add(egui::DragValue::new(&mut mw).speed(0.01).range(crate::view3d::MESH_WIDTH_MIN..=10000.0).max_decimals(3).prefix("Maschenweite ").suffix(" m")).changed() {
                         self.v3d.mesh_width = mw;
+                        if let Some(pr) = self.project.as_mut() {
+                            pr.st.params.mesh_width_3d = mw;
+                            self.dirty = true;
+                        }
                         self.v3d.grid = None;
                     }
                     ui.checkbox(&mut self.v3d.shaded, "farbig");
                     ui.checkbox(&mut self.v3d.wire, "Gitter");
+                    ui.checkbox(&mut self.settings.layers.water, "Wasser");
+                    if ui.button("PDF…").on_hover_text("Gittermodell als vektorbasierte PDF-Datei ausgeben").clicked() {
+                        self.print3d.open = true;
+                    }
                     for (lbl, az) in [("N", 0.0f32), ("O", 1.5708), ("S", 3.1416), ("W", 4.7124)] {
                         if ui.small_button(lbl).on_hover_text("Ansicht aus dieser Himmelsrichtung").clicked() {
                             self.v3d.azimuth = az;
                         }
                     }
                 });
+                self.v3d.frame = self.print3d.open.then(|| self.sheet3d());
+                self.sync_waters_3d();
                 self.v3d.ui(ui, zr);
             });
             self.show_3d = open;
+            self.print3d_dialog(ctx, zr);
         }
+
+        self.water_window(ctx);
 
         if self.show_bklist {
             let mut open = true;
@@ -2783,7 +4001,7 @@ impl DgmApp {
                     ui.label("(0 = aus)");
                 });
                 ui.label("Gespeichert wird der ganze Projektstand als <Projekt>.dgmnt.json im Datenordner;\nder vorherige Stand bleibt als .bak erhalten. Die alten GM-Dateien werden dabei nicht verändert.");
-                ui.checkbox(&mut self.settings.auto_compute, "Beim Laden automatisch vermaschen und Höhenlinien rechnen");
+                ui.checkbox(&mut self.settings.auto_compute, "Beim Laden automatisch vermaschen und Höhenlinien rechnen (bis 11000 Punkte)");
                 if ui.button("Übernehmen").clicked() {
                     self.save_settings();
                 }
@@ -2842,19 +4060,12 @@ impl DgmApp {
                         }
                         Confirm::Remesh => {
                             self.checkpoint();
-                            self.remesh();
+                            self.remesh_manual();
                         }
                         Confirm::ReloadOriginal => {
                             if let Some(pr) = &self.project {
                                 let (dir, name) = (pr.dir.clone(), pr.st.name.clone());
-                                if let Ok(mut np) = Project::load_original(dir, &name) {
-                                    self.checkpoint();
-                                    let (t, _) = tin::triangulate(&np);
-                                    np.st.triangles = t;
-                                    self.project = Some(np);
-                                    self.recompute();
-                                    self.status = "Originaldateien neu eingelesen.".into();
-                                }
+                                self.start_load(dir, &name, LoadMode::Reload);
                             }
                         }
                     }
@@ -2955,12 +4166,14 @@ impl eframe::App for DgmApp {
         if self.view.step(dt) || self.blink.map_or(false, |b| b.1.elapsed().as_secs() < 3) {
             ctx.request_repaint();
         }
-        // shortcuts
+        self.poll_job(&ctx);
+        // shortcuts (während einer Hintergrundarbeit gesperrt)
+        let busy = self.job.is_some();
         let (save, undo, redo) = ctx.input(|i| {
             (
-                i.modifiers.command && i.key_pressed(Key::S),
-                i.modifiers.command && !i.modifiers.shift && i.key_pressed(Key::Z),
-                i.modifiers.command && (i.key_pressed(Key::Y) || (i.modifiers.shift && i.key_pressed(Key::Z))),
+                !busy && i.modifiers.command && i.key_pressed(Key::S),
+                !busy && i.modifiers.command && !i.modifiers.shift && i.key_pressed(Key::Z),
+                !busy && i.modifiers.command && (i.key_pressed(Key::Y) || (i.modifiers.shift && i.key_pressed(Key::Z))),
             )
         });
         if save {
@@ -2976,7 +4189,7 @@ impl eframe::App for DgmApp {
             self.redo();
         }
         // autosave
-        if self.dirty && self.settings.autosave_secs > 0 && self.last_save.elapsed() >= Duration::from_secs(self.settings.autosave_secs) {
+        if !busy && self.dirty && self.settings.autosave_secs > 0 && self.last_save.elapsed() >= Duration::from_secs(self.settings.autosave_secs) {
             self.autosave();
         }
         if self.dirty {
@@ -2996,6 +4209,9 @@ impl eframe::App for DgmApp {
         egui::Panel::left("side").resizable(true).default_size(230.0).show(ui, |ui| self.side_panel(ui));
         egui::CentralPanel::no_frame().show(ui, |ui| self.map_ui(ui));
         self.dialogs(&ctx);
+        self.notice_window(&ctx);
+        self.dxfz_window(&ctx);
+        self.job_window(&ctx);
         if let Some(pr) = &self.project {
             let info = format!("{} Punkte, {} Dreiecke", pr.st.points.len(), self.surface.as_ref().map_or(0, |s| s.tris.len()));
             self.cmp.window(&ctx, &pr.st.name, &info, &pr.st.params);

@@ -7,12 +7,16 @@ mod pdf;
 mod scene;
 mod app;
 mod contours;
+mod dxf_z;
 mod files;
+mod geotiff;
+mod job;
 mod model;
 mod render;
 mod tin;
 mod view;
 mod view3d;
+mod water;
 
 use std::path::PathBuf;
 
@@ -28,7 +32,24 @@ fn app_icon() -> Option<egui::IconData> {
     Some(egui::IconData { rgba: img.into_raw(), width, height })
 }
 
+/// Abstürze (Panic) in %APPDATA%\DGM-NTbsturz.log protokollieren – die Windows-Anwendung hat keine Konsole.
+fn install_crash_log() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if let Some(dir) = std::env::var_os("APPDATA").map(|b| PathBuf::from(b).join("DGM-NT")) {
+            let _ = std::fs::create_dir_all(&dir);
+            let text = format!("{}
+{}
+
+", info, std::backtrace::Backtrace::force_capture());
+            let _ = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("absturz.log")).and_then(|mut f| std::io::Write::write_all(&mut f, text.as_bytes()));
+        }
+        default_hook(info);
+    }));
+}
+
 fn main() -> eframe::Result<()> {
+    install_crash_log();
     let args: Vec<String> = std::env::args().collect();
     let mut screenshot: Option<PathBuf> = None;
     let mut open: Option<PathBuf> = None;
@@ -93,6 +114,9 @@ fn main() -> eframe::Result<()> {
         Box::new(move |cc| {
             let mut a = app::DgmApp::new(cc, screenshot, open, zoom);
             a.set_show_3d(show_3d);
+            if args.iter().any(|a| a == "--mesh") {
+                a.start_mesh();
+            }
             if args_print {
                 a.start_print(portrait);
             }

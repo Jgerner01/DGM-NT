@@ -14,6 +14,7 @@ use crate::pdf::{self, Content};
 use crate::render::{self, caddy, FillCache, Palette};
 use crate::scene::*;
 use crate::tin::Surface;
+use crate::view3d::ProjQuad;
 
 /// Alles, was die Szene aus der Bildschirmdarstellung braucht.
 pub struct Input<'a> {
@@ -252,6 +253,24 @@ pub fn build(inp: &Input) -> Scene {
         }
     }
 
+    // ---- Wasserflächen: Farbfüllung (im DXF nur mit Farbflächen) und Umriss
+    if l.water {
+        let wc = Color32::from_rgb(p.water_rgb[0], p.water_rgb[1], p.water_rgb[2]);
+        let (rgb, cad) = col.get(slot::FILL, Color32::from_rgb(40, 150, 175));
+        for w in &pr.st.waters {
+            let pts: Vec<P2> = w.pts.iter().filter(|&&i| i < pr.st.points.len()).map(|&i| [pr.st.points[i].x, pr.st.points[i].y]).collect();
+            if pts.len() < crate::water::MIN_WATER_POINTS || !bbox_hits(pts_bbox(&pts), reg) {
+                continue;
+            }
+            if want_fill {
+                let xy: Vec<(f64, f64)> = pts.iter().map(|q| (q[0], q[1])).collect();
+                let idx: Vec<u32> = crate::water::triangulate(&xy).iter().flatten().map(|&i| i as u32).collect();
+                push_mesh(&mut sc, layer::FILL, &pts, &vec![wc; pts.len()], &idx, reg);
+            }
+            sc.items.push(Item::Line { layer: layer::FILL, rgb, cad, w_mm: 0.25, pts, z: 0.0, closed: true, dash: false });
+        }
+    }
+
     // ---- Koordinatengitter: Kreuze und Beschriftung am Rand des Ausschnitts
     if l.grid {
         let step = grid_step(p.grid_mm, inp.scale_n, (reg[2] - reg[0]).min(reg[3] - reg[1]));
@@ -469,6 +488,10 @@ fn legend_for(inp: &Input, analysis: bool) -> Legend {
                 blocks.push(Block::Bar { caption: "Neigung".into(), stops, ticks });
             }
         }
+    }
+    if inp.layers.water && !pr.st.waters.is_empty() {
+        let c = p.water_rgb;
+        blocks.push(Block::Swatches { caption: "Wasserfläche".into(), items: vec![(c, format!("{} Wasserfläche(n)", pr.st.waters.len()))] });
     }
     let mut lines = Vec::new();
     if inp.layers.contours {
@@ -746,10 +769,13 @@ fn flow_swatches(c: &mut Content, f: &mut Flow, caption: &str, items: &[(Rgb, St
     f.y = top - per as f64 * step - 2.0;
 }
 
-fn north_arrow(c: &mut Content, cx: f64, cy: f64, h: f64) {
-    // wie auf dem Bildschirm: rechte Hälfte dunkel, linke hell
-    let tip = (cx, cy + h * 0.6);
-    let (r, l, m) = ((cx + h * 0.22, cy - h * 0.4), (cx - h * 0.22, cy - h * 0.4), (cx, cy - h * 0.15));
+fn north_arrow(c: &mut Content, cx: f64, cy: f64, h: f64, dir: (f64, f64)) {
+    // wie auf dem Bildschirm: rechte Hälfte dunkel, linke hell; `dir` dreht den Pfeil (Nord nach oben = (0, 1))
+    let len = dir.0.hypot(dir.1).max(1e-9);
+    let (dx, dy) = (dir.0 / len, dir.1 / len);
+    let rot = |px: f64, py: f64| (cx + px * dy + py * dx, cy - px * dx + py * dy);
+    let tip = rot(0.0, h * 0.6);
+    let (r, l, m) = (rot(h * 0.22, -h * 0.4), rot(-h * 0.22, -h * 0.4), rot(0.0, -h * 0.15));
     c.fill_color([40, 40, 40]);
     c.fill_poly(&[tip, r, m]);
     c.fill_color([255, 255, 255]);
@@ -757,7 +783,8 @@ fn north_arrow(c: &mut Content, cx: f64, cy: f64, h: f64) {
     c.line_width(0.25);
     c.polyline(&[tip, m, l], true);
     c.polyline(&[tip, r, m], true);
-    c.text(cx, cy + h * 0.6 + 1.0, 3.0, true, BLACK, 0.0, 0.5, 0.0, "N", false);
+    let label = rot(0.0, h * 0.6 + 2.6);
+    c.text(label.0, label.1, 3.0, true, BLACK, 0.0, 0.5, 0.5, "N", false);
 }
 
 fn scale_bar(c: &mut Content, x: f64, y: f64, n: f64, max_mm: f64) {
@@ -819,36 +846,40 @@ pub fn render_pdf(sc: &Scene, sheet: &Sheet, origin: P2, n: f64, p: &Params, pro
     c.stroke_color(BLACK);
     c.line_width(0.5);
     c.rect(ax, ay, aw, ah, false, true);
+    draw_strip(&mut c, sheet, n, project, &sc.legend, (0.0, 1.0));
+    let _ = p;
+    pdf::build(&c, w, h, &format!("{} – Druckausgabe", project))
+}
 
-    // ---- Streifen für Legende, Maßstab, Nordpfeil
+/// Streifen für Legende, Maßstab und Nordpfeil. `north` = Richtung des Nordpfeils auf dem Blatt (x nach rechts, y nach oben).
+fn draw_strip(c: &mut Content, sheet: &Sheet, n: f64, project: &str, lg: &Legend, north: (f64, f64)) {
     let (sx, sy, sw, sh) = sheet.strip_rect();
     c.stroke_color([150, 150, 150]);
     c.line_width(0.2);
     c.rect(sx, sy, sw, sh, false, true);
     let date = pdf::today();
     let info = vec![(format!("Maßstab 1:{}", group(n.round().max(1.0) as u64)), true), (format!("Stand: {}", date), false)];
-    let lg = &sc.legend;
     let title = if lg.title.is_empty() { project.to_string() } else { lg.title.clone() };
     let pad = 2.5;
     if sheet.landscape {
         // Spalte von oben nach unten; unten Maßstab und Nordpfeil
         let mut f = Flow { x: sx + pad, w: sw - 2.0 * pad, y: sy + sh - pad };
-        flow_lines(&mut c, &mut f, &[(project.to_string(), true)], 3.2);
+        flow_lines(c, &mut f, &[(project.to_string(), true)], 3.2);
         if title != project {
-            flow_lines(&mut c, &mut f, &[(title, true)], 2.6);
+            flow_lines(c, &mut f, &[(title, true)], 2.6);
         }
         for blk in &lg.blocks {
             match blk {
-                Block::Lines(v) => flow_lines(&mut c, &mut f, v, 2.1),
-                Block::Bar { caption, stops, ticks } => flow_bar(&mut c, &mut f, caption, stops, ticks, false),
-                Block::Swatches { caption, items } => flow_swatches(&mut c, &mut f, caption, items, false),
+                Block::Lines(v) => flow_lines(c, &mut f, v, 2.1),
+                Block::Bar { caption, stops, ticks } => flow_bar(c, &mut f, caption, stops, ticks, false),
+                Block::Swatches { caption, items } => flow_swatches(c, &mut f, caption, items, false),
             }
         }
         let cx = sx + sw / 2.0;
-        north_arrow(&mut c, cx, sy + 44.0, 12.0);
+        north_arrow(c, cx, sy + 44.0, 12.0, north);
         c.text(cx, sy + 30.0, 2.8, true, BLACK, 0.0, 0.5, 0.0, &info[0].0, false);
         c.text(cx, sy + 25.0, 2.1, false, BLACK, 0.0, 0.5, 0.0, &info[1].0, false);
-        scale_bar(&mut c, sx + pad + 2.0, sy + 14.0, n, (sw - 2.0 * pad - 6.0).min(45.0));
+        scale_bar(c, sx + pad + 2.0, sy + 14.0, n, (sw - 2.0 * pad - 6.0).min(45.0));
         c.text(cx, sy + 4.0, 1.7, false, GREY, 0.0, 0.5, 0.0, "DGM-NT", false);
     } else {
         // drei Spalten: Titel/Text | Legende | Maßstab, Nordpfeil
@@ -858,9 +889,9 @@ pub fn render_pdf(sc: &Scene, sheet: &Sheet, origin: P2, n: f64, p: &Params, pro
         let limit = sy + 2.0;
         let mut fa = Flow { x: xa, w: wa - 2.0 * pad, y: top };
         let mut fb = Flow { x: xb, w: wb - 2.0 * pad, y: top };
-        flow_lines(&mut c, &mut fa, &[(project.to_string(), true)], 3.2);
+        flow_lines(c, &mut fa, &[(project.to_string(), true)], 3.2);
         if title != project {
-            flow_lines(&mut c, &mut fa, &[(title, true)], 2.6);
+            flow_lines(c, &mut fa, &[(title, true)], 2.6);
         }
         // Legendenblöcke auf die zwei Spalten verteilen: dorthin, wo noch genug Platz im Streifen ist
         for blk in &lg.blocks {
@@ -877,11 +908,11 @@ pub fn render_pdf(sc: &Scene, sheet: &Sheet, origin: P2, n: f64, p: &Params, pro
             };
             let f = if use_b { &mut fb } else { &mut fa };
             match blk {
-                Block::Lines(v) => flow_lines(&mut c, f, v, 2.1),
-                Block::Bar { caption, stops, ticks } => flow_bar(&mut c, f, caption, stops, ticks, true),
+                Block::Lines(v) => flow_lines(c, f, v, 2.1),
+                Block::Bar { caption, stops, ticks } => flow_bar(c, f, caption, stops, ticks, true),
                 Block::Swatches { caption, items } => {
                     let two = swatch_two_cols(items, f.w);
-                    flow_swatches(&mut c, f, caption, items, two)
+                    flow_swatches(c, f, caption, items, two)
                 }
             }
         }
@@ -891,14 +922,86 @@ pub fn render_pdf(sc: &Scene, sheet: &Sheet, origin: P2, n: f64, p: &Params, pro
             c.polyline(&[(x, sy + 2.0), (x, sy + sh - 2.0)], false);
         }
         let wc = sw - wa - wb - 2.0 * pad;
-        north_arrow(&mut c, xc + wc - 8.0, sy + sh - 14.0, 12.0);
+        north_arrow(c, xc + wc - 8.0, sy + sh - 14.0, 12.0, north);
         c.text(xc, sy + sh - 6.0, 2.8, true, BLACK, 0.0, 0.0, 0.0, &info[0].0, false);
         c.text(xc, sy + sh - 11.0, 2.1, false, BLACK, 0.0, 0.0, 0.0, &info[1].0, false);
-        scale_bar(&mut c, xc + 1.0, sy + 12.0, n, (wc - 6.0).min(40.0));
+        scale_bar(c, xc + 1.0, sy + 12.0, n, (wc - 6.0).min(40.0));
         c.text(xc + wc, sy + 2.5, 1.7, false, GREY, 0.0, 1.0, 0.0, "DGM-NT", false);
     }
-    let _ = p;
-    pdf::build(&c, w, h, &format!("{} – Druckausgabe", project))
+}
+
+// ------------------------------------------------------------------ PDF Gittermodell (3D)
+
+/// Ansichtsdaten des Gittermodells für die Legende der PDF-Ausgabe.
+pub struct Model3dInfo {
+    pub step: f64,
+    pub exaggeration: f64,
+    pub azimuth_deg: f64,
+    pub elevation_deg: f64,
+    pub zr: (f64, f64),
+    pub shaded: bool,
+    /// Farbe und Anzahl der Wasserflächen im Modell
+    pub water: Option<(Rgb, usize)>,
+}
+
+/// Anzahl der Himmelsrichtungen für die Blickrichtung (45°-Schritte)
+const COMPASS_STEPS: usize = 8;
+/// Anzahl der Teilstriche minus eins an der Höhenleiste
+const HEIGHT_TICKS: usize = 4;
+/// Stützstellen der Höhenleiste minus eins
+const HEIGHT_STOPS: usize = 12;
+/// Linienbreite der Rasterfelder im PDF (mm)
+const WIRE_W_MM: f64 = 0.1;
+/// Farbe der Gitterlinien im PDF
+const WIRE_RGB: Rgb = [45, 55, 65];
+
+/// Legende zum Gittermodell: Ansichtsdaten und, bei farbiger Darstellung, die Höhenleiste.
+pub fn legend_3d(i: &Model3dInfo) -> Legend {
+    const NAMES: [&str; COMPASS_STEPS] = ["Norden", "Nordosten", "Osten", "Südosten", "Süden", "Südwesten", "Westen", "Nordwesten"];
+    let deg = i.azimuth_deg.rem_euclid(360.0);
+    let name = NAMES[(deg / (360.0 / COMPASS_STEPS as f64)).round() as usize % COMPASS_STEPS];
+    let mut blocks = vec![Block::Lines(vec![
+        (format!("Maschenweite {} m", trim_num((i.step * 100.0).round() / 100.0)), false),
+        (format!("Überhöhung {:.1}-fach", i.exaggeration), false),
+        (format!("Ansicht aus {} ({:.0}°), Neigung {:.0}°", name, deg, i.elevation_deg), false),
+    ])];
+    if i.shaded {
+        let stops = (0..=HEIGHT_STOPS).map(|k| (k as f64 / HEIGHT_STOPS as f64, rgb_of(render::height_color(k as f64 / HEIGHT_STOPS as f64)))).collect();
+        let ticks = (0..=HEIGHT_TICKS).map(|k| (k as f64 / HEIGHT_TICKS as f64, format!("{:.1}", i.zr.0 + (i.zr.1 - i.zr.0) * k as f64 / HEIGHT_TICKS as f64))).collect();
+        blocks.push(Block::Bar { caption: "Höhe in m".into(), stops, ticks });
+    }
+    if let Some((rgb, n)) = i.water {
+        blocks.push(Block::Swatches { caption: "Wasserfläche".into(), items: vec![(rgb, format!("{} Wasserfläche(n)", n))] });
+    }
+    blocks.push(Block::Lines(vec![("Maßstab gilt waagrecht in Bildrichtung; Höhen sind überhöht.".into(), false)]));
+    Legend { title: "Gittermodell (3D)".into(), blocks }
+}
+
+/// PDF-Seite mit dem Gittermodell als Vektorgrafik (Malerverfahren, ein Polygon je Rasterfeld), mittig in der
+/// Zeichenfläche wie im Druckrahmen des Fensters, mit Rahmen, Legende, Maßstab und Nordpfeil. `quads` sind von hinten nach vorn sortiert.
+pub fn render_pdf_3d(quads: &[ProjQuad], pan: (f64, f64), wire: bool, legend: &Legend, north: (f64, f64), sheet: &Sheet, n: f64, project: &str) -> Vec<u8> {
+    let (w, h) = sheet.size();
+    let (ax, ay, aw, ah) = sheet.area();
+    let mm = 1000.0 / n;
+    // Die Modellmitte liegt wie im Fenster in der Blattmitte, verschoben um `pan` (m)
+    let tr = |(u, v): (f64, f64)| (w * 0.5 + (u + pan.0) * mm, h * 0.5 - (v + pan.1) * mm);
+    let mut c = Content::new();
+    c.round_joins();
+    c.save();
+    c.clip_rect(ax, ay, aw, ah);
+    c.line_width(if wire { WIRE_W_MM } else { WIRE_W_MM * 0.8 });
+    for q in quads {
+        let pts: Vec<(f64, f64)> = q.p.iter().map(|&p| tr(p)).collect();
+        c.fill_color(q.rgb);
+        c.stroke_color(if wire && !q.water { WIRE_RGB } else { q.rgb });
+        c.fill_stroke_poly(&pts);
+    }
+    c.restore();
+    c.stroke_color(BLACK);
+    c.line_width(0.5);
+    c.rect(ax, ay, aw, ah, false, true);
+    draw_strip(&mut c, sheet, n, project, legend, north);
+    pdf::build(&c, w, h, &format!("{} – Gittermodell", project))
 }
 
 #[cfg(test)]
@@ -1307,5 +1410,52 @@ mod strip_layout_tests {
                 assert!(lowest >= sy + 1.0 - 1e-6, "tiefster Text y {:.1} im Streifen ab {:.1}", lowest, sy);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod pdf_3d_tests {
+    use super::*;
+    use crate::view3d::{Grid3d, View3d};
+    use lopdf::Document;
+
+    /// Kleines Geländestück als Raster mit einer Beule in der Mitte.
+    fn sample_view() -> View3d {
+        let (nx, ny) = (12, 9);
+        let z = (0..nx * ny).map(|k| Some(((k % nx) as f64 - 5.5).hypot((k / nx) as f64 - 4.0).recip().min(2.0))).collect();
+        View3d { grid: Some(Grid3d { step: 5.0, nx, ny, x0: 1000.0, y0: 2000.0, z }), ..View3d::default() }
+    }
+
+    #[test]
+    fn model_3d_pdf_is_parsable_vector_with_legend() {
+        let v = sample_view();
+        let zr = (0.0, 2.0);
+        let quads = v.quads(zr);
+        assert_eq!(quads.len(), 11 * 8);
+        let info = Model3dInfo { step: 5.0, exaggeration: 2.0, azimuth_deg: 34.0, elevation_deg: 31.0, zr, shaded: true, water: None };
+        let legend = legend_3d(&info);
+        for landscape in [false, true] {
+            let sheet = Sheet::new(landscape);
+            let bytes = render_pdf_3d(&quads, (3.0, -2.0), true, &legend, v.north_dir(), &sheet, 500.0, "Beispiel");
+            assert!(bytes.starts_with(b"%PDF-1.5") && bytes.ends_with(b"%%EOF\n"));
+            assert!(!String::from_utf8_lossy(&bytes).contains("/Subtype /Image"));
+            let doc = Document::load_mem(&bytes).expect("PDF lässt sich einlesen");
+            assert_eq!(doc.get_pages().len(), 1);
+        }
+    }
+
+    #[test]
+    fn water_cells_are_added_and_unwired() {
+        let mut v = sample_view();
+        let zr = (0.0, 2.0);
+        let plain = v.quads(zr).len();
+        let plane = crate::water::PlaneFit { x0: 1030.0, y0: 2020.0, z0: 0.5, a: 0.0, b: 0.0 };
+        v.waters.push(crate::view3d::WaterShape { poly: vec![(1010.0, 2010.0), (1050.0, 2010.0), (1050.0, 2030.0), (1010.0, 2030.0)], plane });
+        let q = v.quads(zr);
+        let wq = q.iter().filter(|x| x.water).count();
+        assert!(wq > 20 && q.len() == plain + wq);
+        let info = Model3dInfo { step: 5.0, exaggeration: 2.0, azimuth_deg: 0.0, elevation_deg: 30.0, zr, shaded: true, water: Some(([160, 235, 245], 1)) };
+        let bytes = render_pdf_3d(&q, (0.0, 0.0), true, &legend_3d(&info), v.north_dir(), &Sheet::new(true), 500.0, "Beispiel");
+        assert!(lopdf::Document::load_mem(&bytes).is_ok());
     }
 }

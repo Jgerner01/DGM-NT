@@ -146,6 +146,14 @@ impl Content {
         self.path(pts);
         self.s += "f\n";
     }
+    /// Geschlossenes Polygon, gefüllt und mit Kontur in der aktuellen Strich- und Füllfarbe.
+    pub fn fill_stroke_poly(&mut self, pts: &[(f64, f64)]) {
+        if pts.len() < 3 {
+            return;
+        }
+        self.path(pts);
+        self.s += "b\n";
+    }
     pub fn rect(&mut self, x: f64, y: f64, w: f64, h: f64, fill: bool, stroke: bool) {
         let _ = writeln!(self.s, "{} {} {} {} re {}", n(x), n(y), n(w), n(h), match (fill, stroke) {
             (true, true) => "B",

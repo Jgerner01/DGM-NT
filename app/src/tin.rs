@@ -3,7 +3,17 @@
 use spade::{ConstrainedDelaunayTriangulation, HasPosition, Point2, Triangulation};
 use std::collections::{HashMap, HashSet};
 
+use crate::job::ProgressFn;
 use crate::model::{Project, Tri};
+
+/// Fortschrittsmeldung der Vermaschung alle so viele Elemente.
+const MESH_PROGRESS_STEP: usize = 1024;
+const MESH_STAGE: &str = "Dreiecksvermaschung";
+/// Anteile der Arbeitsschritte am Gesamtfortschritt der Vermaschung
+const SHARE_DEDUP: f32 = 0.15;
+const SHARE_DELAUNAY: f32 = 0.60;
+const SHARE_CONSTRAINTS: f32 = 0.70;
+const SHARE_FACES: f32 = 0.90;
 
 #[derive(Clone, Copy)]
 struct V {
@@ -28,6 +38,9 @@ pub struct MeshReport {
 /// Minimum distance below which two points count as identical (dgm.sys line 14: 0.05 m).
 pub const IDENTICAL_DIST: f64 = 0.05;
 
+/// Höchstzahl der Durchgänge beim Entfernen schmaler Randdreiecke
+const NARROW_ROUNDS: usize = 50;
+
 pub fn point_in_poly(x: f64, y: f64, poly: &[(f64, f64)]) -> bool {
     let mut inside = false;
     let n = poly.len();
@@ -45,7 +58,13 @@ pub fn point_in_poly(x: f64, y: f64, poly: &[(f64, f64)]) -> bool {
 
 /// Build the triangles for the active points of a project.
 pub fn triangulate(pr: &Project) -> (Vec<Tri>, MeshReport) {
+    triangulate_progress(pr, &mut |_, _| {})
+}
+
+/// Wie `triangulate`, meldet aber den Fortschritt (Anteil 0..1 der gesamten Vermaschung).
+pub fn triangulate_progress(pr: &Project, progress: ProgressFn) -> (Vec<Tri>, MeshReport) {
     let st = &pr.st;
+    progress(0.0, "Dreiecksvermaschung: identische Punkte suchen");
     let (ox, oy) = pr.bbox().map(|b| (b[0], b[1])).unwrap_or((0.0, 0.0));
     // dedupe within IDENTICAL_DIST using a hash grid
     let mut grid: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
@@ -53,6 +72,9 @@ pub fn triangulate(pr: &Project) -> (Vec<Tri>, MeshReport) {
     let mut dups = 0;
     let cell = IDENTICAL_DIST.max(1e-6);
     for (i, p) in st.points.iter().enumerate() {
+        if i % MESH_PROGRESS_STEP == 0 {
+            progress(SHARE_DEDUP * i as f32 / st.points.len().max(1) as f32, "Dreiecksvermaschung: identische Punkte suchen");
+        }
         if !p.active || !pr.code_ok(p) {
             continue;
         }
@@ -82,6 +104,8 @@ pub fn triangulate(pr: &Project) -> (Vec<Tri>, MeshReport) {
         .iter()
         .map(|&i| V { p: Point2::new(st.points[i].x - ox, st.points[i].y - oy), idx: i })
         .collect();
+    // das Delaunay-Verfahren selbst meldet keinen Zwischenstand
+    progress(SHARE_DEDUP, "Dreiecksvermaschung: Delaunay-Dreiecke bilden");
     let Ok(mut cdt) = ConstrainedDelaunayTriangulation::<V>::bulk_load(verts) else {
         return (vec![], MeshReport { points_used: 0, duplicates: dups, triangles: 0, constraints_skipped: 0 });
     };
@@ -113,7 +137,12 @@ pub fn triangulate(pr: &Project) -> (Vec<Tri>, MeshReport) {
     }
     let mut skipped = 0;
     let mut cons: HashSet<(usize, usize)> = HashSet::new();
-    for (a, b) in segs {
+    let seg_count = segs.len().max(1);
+    progress(SHARE_DELAUNAY, "Dreiecksvermaschung: Bruchkanten und Ringe einarbeiten");
+    for (k, (a, b)) in segs.into_iter().enumerate() {
+        if k % MESH_PROGRESS_STEP == 0 {
+            progress(SHARE_DELAUNAY + (SHARE_CONSTRAINTS - SHARE_DELAUNAY) * k as f32 / seg_count as f32, "Dreiecksvermaschung: Bruchkanten und Ringe einarbeiten");
+        }
         let (Some(&ha), Some(&hb)) = (handle.get(&a), handle.get(&b)) else {
             skipped += 1;
             continue;
@@ -133,7 +162,11 @@ pub fn triangulate(pr: &Project) -> (Vec<Tri>, MeshReport) {
     let ins: Vec<Vec<(f64, f64)>> = st.inrings.iter().filter(|r| r.len() >= 3).map(poly).collect();
     let max2 = st.params.max_side * st.params.max_side;
     let mut tris: Vec<[usize; 3]> = Vec::new();
-    for f in cdt.inner_faces() {
+    let face_count = cdt.num_inner_faces().max(1);
+    for (k, f) in cdt.inner_faces().enumerate() {
+        if k % MESH_PROGRESS_STEP == 0 {
+            progress(SHARE_CONSTRAINTS + (SHARE_FACES - SHARE_CONSTRAINTS) * k as f32 / face_count as f32, "Dreiecksvermaschung: Dreiecke prüfen");
+        }
         let vs = f.vertices();
         let ids = [vs[0].data().idx, vs[1].data().idx, vs[2].data().idx];
         let p = |i: usize| &st.points[ids[i]];
@@ -163,7 +196,8 @@ pub fn triangulate(pr: &Project) -> (Vec<Tri>, MeshReport) {
     // remove narrow border triangles (min. Dreieckswinkel, gon), repeatedly
     let min_ang = st.params.min_angle_gon * std::f64::consts::PI / 200.0;
     if min_ang > 0.0 {
-        for _ in 0..50 {
+        for round in 0..NARROW_ROUNDS {
+            progress(SHARE_FACES + (1.0 - SHARE_FACES) * round as f32 / NARROW_ROUNDS as f32, "Dreiecksvermaschung: Randdreiecke entfernen");
             let mut edge_count: HashMap<(usize, usize), u32> = HashMap::new();
             for t in &tris {
                 for e in 0..3 {
@@ -185,6 +219,7 @@ pub fn triangulate(pr: &Project) -> (Vec<Tri>, MeshReport) {
         }
     }
     let n = tris.len();
+    progress(1.0, MESH_STAGE);
     (
         tris.into_iter().map(|v| Tri { v, active: true }).collect(),
         MeshReport { points_used: used.len(), duplicates: dups, triangles: n, constraints_skipped: skipped },

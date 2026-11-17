@@ -34,6 +34,13 @@ Zeile für Zeile; Vorgaben, falls die Datei fehlt (aus demselben Code):
 ## Weitere Dateien
 
 - **GM1**: `Punktbezeichnung Rechtswert Hochwert Höhe [Code]`, durch Leerzeichen/Tabs getrennt (Handbuch).
+- **GeoTIFF → GM1 (neu):** Das Menü „Datei → GEO-TIFF in GM1 umwandeln…“ liest einbandige
+  GeoTIFF-Höhenraster mit Pixelmaßstab/Tiepoint oder Transformationsmatrix. Es wird jeweils das erste Rasterband
+  verwendet, NoData und nicht endliche Höhenwerte werden ausgelassen. Die Rechts-/Hochwerte beziehen sich auf die
+  Pixelmitten (außer bei `PixelIsPoint`); projizierte Fuß-Einheiten werden in Meter umgerechnet, geografische
+  Gradwerte werden abgewiesen. Mehrere Dateien werden in der Auswahlreihenfolge in eine gemeinsame GM1 geschrieben,
+  mit je eigener Punktzählung und Namen `Kachel_Punkt` (z. B. `2_15`). Für mehrere Dateien müssen die projizierten
+  EPSG-Kennungen übereinstimmen bzw. auf allen Dateien fehlen.
 - **GM2** Bruchkanten: ein Punktname pro Zeile, jedes Polygon endet mit `#`, weiche mit `##` (Handbuch).
 - **GM9** Umring/Inringe (Leseroutine 0x50793c): Punktnamen je Zeile, eine Gruppe endet mit `#`
   (Konstante 0x507e60) oder Dateiende. Erste Gruppe = Umring (max. 8000 Punkte), jede weitere = Inring
@@ -174,7 +181,7 @@ Schnittkante, gemeinsamer Umring). Größen (Linienbreite, Schrifthöhe, Kreisra
 Höhenlinienbeschriftungen unterbrechen die Linie. Punktbeschriftungen erscheinen nur, wo sie auf dem Papier Platz
 haben (mittlerer Punktabstand > 9 mm).
 
-### Parameter für den Export (Parameterdatei GM0, Zeilen 38–55; neu)
+### Parameter für den Export (Parameterdatei GM0, Zeilen 38–56; neu)
 Das alte Programm liest nur 37 Zeilen, die zusätzlichen Zeilen ändern an dessen Verhalten nichts.
 
 | Zeile | Bedeutung | Vorgabe |
@@ -185,6 +192,7 @@ Das alte Programm liest nur 37 Zeilen, die zusätzlichen Zeilen ändern an desse
 | 41 | Schrifthöhe Zähllinien (mm) | 2.0 |
 | 42 | Schrifthöhe Gitter/Koordinaten (mm) | 2.0 |
 | 43–55 | CAD-Farbnummern (CADdy 1..12): Punktsymbole, Punktnummern, Punkthöhen, Umring, Höhenlinien, Zähllinien, Bruchkanten, Gitter, Dreiecke, Grundriss, Abtrag, Auftrag, Schnittkante | 1, 1, 6, 5, 2, 3, 11, 4, 6, 7, 9, 12, 7 |
+| 56 | Rechengrenze (Punkte): darüber sind Vermaschung, Höhenlinien und Analysen abgeschaltet; Vorgabe 100000 | 100000 |
 
 Die Vorgaben der Farben entsprechen `dgm.sys` (siehe oben). Zusätzlich gelten aus der Parameterdatei die CAD-Ebenen
 (Zeilen 25–37) und der Abstand der Gitterkreuze (Zeile 19, mm Papier). Die Bedeutung der Zeilen 16/17

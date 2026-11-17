@@ -4,10 +4,14 @@
 //! Layouts are documented in MECHANICS.md.
 
 use std::fs;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
+use crate::job::ProgressFn;
 use crate::model::{Params, Point};
+
+/// Fortschrittsmeldung beim Einlesen alle so viele Zeilen.
+const READ_PROGRESS_LINES: usize = 2048;
 
 /// Read a text file the way the old program wrote it (Windows-1252, CR/LF).
 pub fn read_text(path: &Path) -> std::io::Result<String> {
@@ -88,10 +92,24 @@ pub fn list_projects(dir: &Path) -> Vec<String> {
 // ---------------------------------------------------------------- GM1
 
 /// GM1: `Punktbezeichnung Rechtswert Hochwert Höhe [Code]`, separated by blanks/tabs.
+#[allow(dead_code)]
 pub fn read_gm1(path: &Path, p: &Params) -> std::io::Result<Vec<Point>> {
+    read_gm1_progress(path, p, &mut |_, _| {})
+}
+
+/// Wie `read_gm1`, meldet aber den Fortschritt (gelesene Bytes / Dateigröße).
+pub fn read_gm1_progress(path: &Path, p: &Params, progress: ProgressFn) -> std::io::Result<Vec<Point>> {
+    const STAGE: &str = "Punkte einlesen";
+    progress(0.0, STAGE);
     let text = read_text(path)?;
+    let total = text.len().max(1) as f32;
+    let mut done = 0usize;
     let mut pts = Vec::new();
-    for line in text.lines() {
+    for (n, line) in text.lines().enumerate() {
+        done += line.len() + 1;
+        if n % READ_PROGRESS_LINES == 0 {
+            progress(done as f32 / total, STAGE);
+        }
         let t: Vec<&str> = line.split_whitespace().collect();
         if t.len() < 4 {
             continue;
@@ -103,9 +121,6 @@ pub fn read_gm1(path: &Path, p: &Params) -> std::io::Result<Vec<Point>> {
         ) else {
             continue;
         };
-        if x == 0.0 && y == 0.0 {
-            continue;
-        }
         pts.push(Point {
             name: t[0].to_string(),
             x: x * p.scale_xy,
@@ -117,6 +132,7 @@ pub fn read_gm1(path: &Path, p: &Params) -> std::io::Result<Vec<Point>> {
             added: false,
         });
     }
+    progress(1.0, STAGE);
     Ok(pts)
 }
 
@@ -180,6 +196,8 @@ pub fn read_gm0(path: &Path) -> Option<Params> {
             p.exp_colors[i] = v;
         }
     }
+    // Rechengrenze (Zeile 56); fehlt sie, gilt die Vorgabe
+    p.max_calc_points = f(55, p.max_calc_points as f64).clamp(1.0, u32::MAX as f64) as u32;
     Some(p)
 }
 
@@ -228,6 +246,46 @@ pub fn write_gm1(path: &Path, pts: &[(String, f64, f64, f64, String)]) -> std::i
         s += &format!("{:>12} {:>15.3} {:>15.3} {:>10.3} {}\n", name, x, y, z, code);
     }
     write_text(path, &s)
+}
+
+/// Punkte einer Punktdatei GM1 schreiben (Ausschnitt). Koordinaten und Höhen werden durch die beim
+/// Einlesen angewandten Maßstäbe geteilt, damit die Datei beim erneuten Einlesen dieselben Werte ergibt.
+pub fn write_gm1_points<'a>(path: &Path, pts: impl Iterator<Item = &'a Point>, scale_xy: f64, scale_h: f64) -> std::io::Result<usize> {
+    let nonzero = |s: f64| if s == 0.0 || !s.is_finite() { 1.0 } else { s };
+    let (sxy, sh) = (nonzero(scale_xy), nonzero(scale_h));
+    let mut count = 0usize;
+    write_gm1_stream(path, |w| {
+        for p in pts {
+            let line = format!("{:>12} {:>15.3} {:>15.3} {:>10.3} {}
+", p.name, p.x / sxy, p.y / sxy, p.z / sh, p.code);
+            w.write_all(&to_cp1252(&line))?;
+            count += 1;
+        }
+        Ok(())
+    })?;
+    Ok(count)
+}
+
+/// Write a GM1 file incrementally without keeping all points in memory.
+pub fn write_gm1_stream<F>(path: &Path, write_points: F) -> std::io::Result<()>
+where
+    F: FnOnce(&mut dyn Write) -> std::io::Result<()>,
+{
+    let tmp = path.with_extension("tmp~");
+    let result = (|| {
+        let file = fs::File::create(&tmp)?;
+        let mut writer = BufWriter::new(file);
+        write_points(&mut writer)?;
+        writer.flush()?;
+        let file = writer.into_inner().map_err(|e| e.into_error())?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
 }
 
 // ---------------------------------------------------------------- GM2 / GM9 / GMG
@@ -404,15 +462,43 @@ mod tests {
     }
 
     #[test]
+    fn read_gm1_reports_progress_and_window_roundtrip() {
+        let dir = std::env::temp_dir().join("dgmnt-gm1-window-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("w.gm1");
+        let pts: Vec<(String, f64, f64, f64, String)> =
+            (0..5000).map(|i| (format!("P{}", i), i as f64, (i % 50) as f64, 1.5, String::new())).collect();
+        write_gm1(&path, &pts).unwrap();
+        let mut seen: Vec<f32> = Vec::new();
+        let all = read_gm1_progress(&path, &Params::default(), &mut |f, _| seen.push(f)).unwrap();
+        assert_eq!(all.len(), 5000);
+        assert!(seen.len() >= 3);
+        assert!(seen.windows(2).all(|w| w[0] <= w[1]));
+        assert_eq!(*seen.last().unwrap(), 1.0);
+        // Ausschnitt schreiben und wieder lesen
+        let inside: Vec<&Point> = all.iter().filter(|p| p.x >= 100.0 && p.x <= 199.0).collect();
+        let out = dir.join("cut.gm1");
+        assert_eq!(write_gm1_points(&out, inside.into_iter(), 1.0, 1.0).unwrap(), 100);
+        let back = read_gm1(&out, &Params::default()).unwrap();
+        assert_eq!(back.len(), 100);
+        assert_eq!((back[0].name.as_str(), back[0].x, back[0].z), ("P100", 100.0, 1.5));
+    }
+
+    #[test]
     fn gm1_roundtrip() {
         let dir = std::env::temp_dir().join("dgmnt-gm1-test");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("t.gm1");
-        let pts = vec![("D1".to_string(), 729888.173, 215917.12, -0.304, String::new()), ("D2".to_string(), 729888.5, 215917.0, 0.0, "SK".to_string())];
+        let pts = vec![
+            ("D1".to_string(), 729888.173, 215917.12, -0.304, String::new()),
+            ("D2".to_string(), 729888.5, 215917.0, 0.0, "SK".to_string()),
+            ("D3".to_string(), 0.0, 0.0, 1.25, String::new()),
+        ];
         write_gm1(&path, &pts).unwrap();
         let back = read_gm1(&path, &Params::default()).unwrap();
-        assert_eq!(back.len(), 2);
+        assert_eq!(back.len(), 3);
         assert_eq!((back[0].name.as_str(), back[0].x, back[0].y, back[0].z), ("D1", 729888.173, 215917.12, -0.304));
         assert_eq!(back[1].code, "SK");
+        assert_eq!((back[2].name.as_str(), back[2].x, back[2].y, back[2].z), ("D3", 0.0, 0.0, 1.25));
     }
 }

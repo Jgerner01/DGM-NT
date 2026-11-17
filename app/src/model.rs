@@ -5,11 +5,19 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::files;
+use crate::job::ProgressFn;
 
 /// Limits of the GM9 reader in the original (0x50793c).
 pub const MAX_UMRING_POINTS: usize = 8000;
 pub const MAX_INRING_POINTS: usize = 100;
 pub const MAX_INRINGS: usize = 16;
+
+/// Ab dieser Punktzahl werden Vermaschung und Höhenlinien nicht mehr automatisch gerechnet.
+pub const AUTO_CALC_LIMIT_POINTS: usize = 11_000;
+/// Ab dieser Punktzahl wird beim Einlesen eine Warnung ausgegeben.
+pub const WARN_POINTS: usize = 50_000;
+/// Vorgabe der einstellbaren Rechengrenze: darüber sind alle weiteren Berechnungen abgeschaltet.
+pub const DEFAULT_MAX_CALC_POINTS: u32 = 100_000;
 
 /// Values of the GM0 parameter file (defaults from 0x51322c, see MECHANICS.md).
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -53,6 +61,12 @@ pub struct Params {
     pub exp_text_grid_mm: f64,
     /// CAD-Farbnummern (CADdy 1..12) je Element, Reihenfolge siehe `EXP_COLOR_NAMES`
     pub exp_colors: [i32; 13],
+    /// Rechengrenze: bei mehr Punkten sind Vermaschung, Höhenlinien und Analysen abgeschaltet (Zeile 56 der Parameterdatei)
+    pub max_calc_points: u32,
+    /// Farbe der Wasserflächen (RGB), nur in der Projektdatei .dgmnt.json gespeichert
+    pub water_rgb: [u8; 3],
+    /// Maschenweite des Gittermodells (3D) in m; 0 = automatisch. Nur in der Projektdatei .dgmnt.json gespeichert
+    pub mesh_width_3d: f64,
 }
 
 /// Namen der Farbfelder in `Params::exp_colors` (Reihenfolge = Zeilen 43..55 der Parameterdatei).
@@ -109,6 +123,9 @@ impl Default for Params {
             // dgm.sys: Punkte 1, Nummern 1, Höhe 6, Umring 5, Höhenlinien 2, Zähllinien 3, Bruchkanten 11,
             // Gitter 4, Dreiecke 6, Grundriss 7; dazu Abtrag 9, Auftrag 12, Schnittkante 7
             exp_colors: [1, 1, 6, 5, 2, 3, 11, 4, 6, 7, 9, 12, 7],
+            max_calc_points: DEFAULT_MAX_CALC_POINTS,
+            water_rgb: crate::water::DEFAULT_WATER_RGB,
+            mesh_width_3d: 0.0,
         }
     }
 }
@@ -159,6 +176,8 @@ pub struct ProjectState {
     pub breaklines: Vec<Polyline>,
     pub umring: Vec<usize>,
     pub inrings: Vec<Vec<usize>>,
+    /// Wasserflächen (bis `water::MAX_WATERS`)
+    pub waters: Vec<crate::water::Water>,
     pub plan_lines: Vec<Polyline>,
     pub triangles: Vec<Tri>,
     pub manual_labels: Vec<ManualLabel>,
@@ -186,11 +205,16 @@ impl Project {
 
     /// Load from the old files of a data folder (GM0, GM1, GM2, GM9, GMG).
     pub fn load_original(dir: PathBuf, name: &str) -> Result<Project, String> {
+        Self::load_original_progress(dir, name, &mut |_, _| {})
+    }
+
+    /// Wie `load_original`, meldet aber den Fortschritt (Anteil 0..1 je Arbeitsschritt).
+    pub fn load_original_progress(dir: PathBuf, name: &str, progress: ProgressFn) -> Result<Project, String> {
         let params = files::find_ext(&dir, name, "gm0")
             .and_then(|p| files::read_gm0(&p))
             .unwrap_or_default();
         let gm1 = files::find_ext(&dir, name, "gm1").ok_or_else(|| format!("Keine Punktdatei {}.gm1 gefunden", name))?;
-        let points = files::read_gm1(&gm1, &params).map_err(|e| format!("{}: {}", gm1.display(), e))?;
+        let points = files::read_gm1_progress(&gm1, &params, progress).map_err(|e| format!("{}: {}", gm1.display(), e))?;
         let mut pr = Project {
             dir: dir.clone(),
             st: ProjectState { name: name.to_string(), params, points, ..Default::default() },

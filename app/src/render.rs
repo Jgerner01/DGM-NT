@@ -104,6 +104,10 @@ pub enum FillMode {
     Slope,
 }
 
+/// Obergrenze der Eckpunkte des Farbnetzes; darüber wird die Dreiecksunterteilung verringert
+/// (die Grafikkarte nimmt je Bild nur Puffer bis 256 MB an).
+const MAX_FILL_VERTICES: usize = 3_000_000;
+
 /// Pre-computed coloured mesh of the curved surface (built once, moved every frame).
 pub struct FillCache {
     pos: Vec<[f64; 2]>,
@@ -117,7 +121,10 @@ impl FillCache {
         if mode == FillMode::None || s.tris.is_empty() {
             return None;
         }
-        let n = sub.clamp(1, 6);
+        let mut n = sub.clamp(1, 6);
+        while n > 1 && s.tris.len() * (n + 1) * (n + 2) / 2 > MAX_FILL_VERTICES {
+            n -= 1;
+        }
         let mut pos = Vec::new();
         let mut col = Vec::new();
         let mut idx: Vec<u32> = Vec::new();
@@ -207,10 +214,24 @@ impl FillCache {
         }
         let mut mesh = Mesh::default();
         mesh.vertices.reserve(self.pos.len());
+        let mut scr: Vec<Pos2> = Vec::with_capacity(self.pos.len());
         for (p, c) in self.pos.iter().zip(&self.col) {
-            mesh.colored_vertex(view.to_screen(rect, p[0], p[1]), c.gamma_multiply(alpha));
+            let sp = view.to_screen(rect, p[0], p[1]);
+            scr.push(sp);
+            mesh.colored_vertex(sp, c.gamma_multiply(alpha));
         }
-        mesh.indices = self.idx.clone();
+        // nur Dreiecke, die das Zeichenfeld berühren
+        mesh.indices.reserve(self.idx.len().min(1 << 20));
+        for t in self.idx.chunks_exact(3) {
+            let (a, b, c) = (scr[t[0] as usize], scr[t[1] as usize], scr[t[2] as usize]);
+            let outside = (a.x.max(b.x).max(c.x) < rect.left())
+                || (a.x.min(b.x).min(c.x) > rect.right())
+                || (a.y.max(b.y).max(c.y) < rect.top())
+                || (a.y.min(b.y).min(c.y) > rect.bottom());
+            if !outside {
+                mesh.indices.extend_from_slice(t);
+            }
+        }
         painter.add(Shape::mesh(mesh));
     }
 }
