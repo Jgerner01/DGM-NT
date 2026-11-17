@@ -1,7 +1,9 @@
-//! Minimaler PDF-Schreiber für die Druckausgabe: reine Vektorgrafik (Pfade, Text in Helvetica,
+//! Minimaler PDF-Schreiber für die Druckausgabe: reine Vektorgrafik (Pfade, Text in Helvetica, Courier oder einer
+//! eingebetteten TrueType-Schrift (Normschrift),
 //! Gouraud-Dreiecksnetze für Farbflächen). Alle Maße in mm, Ursprung links unten.
 
 use std::fmt::Write as _;
+use std::path::Path;
 
 use crate::files::to_cp1252;
 use crate::scene::Rgb;
@@ -9,6 +11,10 @@ use crate::scene::Rgb;
 const PT: f64 = 72.0 / 25.4;
 /// Höhe der Großbuchstaben von Helvetica (1/1000 der Schriftgröße)
 const CAP: f64 = 0.718;
+/// Höhe der Großbuchstaben von Courier (1/1000 der Schriftgröße)
+const MONO_CAP: f64 = 0.562;
+/// Zeichenbreite von Courier (Anteil der Schriftgröße)
+const MONO_ADVANCE: f64 = 0.6;
 
 #[rustfmt::skip]
 const W_REG: [u16; 95] = [
@@ -83,6 +89,71 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
+/// erster und letzter Zeichencode der eingebetteten Schrift (WinAnsi)
+const FIRST_CHAR: usize = 32;
+const LAST_CHAR: usize = 255;
+/// Höhe der Großbuchstaben, wenn die Schrift keine angibt (Anteil der Schriftgröße)
+const DEFAULT_CAP: f64 = 0.7;
+/// Zeichen der Codes 0x80..0x9F in Windows-1252 (Leerzeichen = nicht belegt)
+const CP1252_HIGH: [char; 32] = [
+    '€', ' ', '‚', 'ƒ', '„', '…', '†', '‡', 'ˆ', '‰', 'Š', '‹', 'Œ', ' ', 'Ž', ' ', ' ', '‘', '’', '“', '”', '•', '–', '—', '˜', '™', 'š', '›', 'œ', ' ', 'ž', 'Ÿ',
+];
+/// Normschriften, die auf Windows-Rechnern mit CAD-Programmen oft vorhanden sind (Dateinamen im Schriftenordner)
+const STANDARD_FONT_FILES: [&str; 6] = ["isocpeur.ttf", "ISOCPEUR.TTF", "GENISO.ttf", "NLCS-ISO.ttf", "isocp.ttf", "GOST_Common.ttf"];
+
+/// Eingebettete TrueType-Schrift (z. B. Normschrift ISO 3098) für Text im PDF.
+#[derive(Clone)]
+pub struct EmbeddedFont {
+    pub name: String,
+    data: Vec<u8>,
+    /// Breiten der Codes FIRST_CHAR..=LAST_CHAR in 1/1000 der Schriftgröße
+    widths: Vec<u16>,
+    /// Höhe der Großbuchstaben (Anteil der Schriftgröße)
+    cap: f64,
+    ascent: i32,
+    descent: i32,
+    bbox: [i32; 4],
+}
+
+impl EmbeddedFont {
+    fn width(&self, text: &str, size: f64) -> f64 {
+        to_cp1252(text).iter().map(|&b| self.widths.get((b as usize).wrapping_sub(FIRST_CHAR)).copied().unwrap_or(0) as f64).sum::<f64>() / 1000.0 * size
+    }
+}
+
+/// Liest eine TrueType-Schriftdatei; Schriften, die nicht eingebettet werden dürfen, werden abgelehnt.
+pub fn load_font(path: &Path) -> Result<EmbeddedFont, String> {
+    let data = std::fs::read(path).map_err(|e| format!("{}: {}", path.display(), e))?;
+    let face = ttf_parser::Face::parse(&data, 0).map_err(|e| format!("{}: keine lesbare TrueType-Schrift ({})", path.display(), e))?;
+    if matches!(face.permissions(), Some(ttf_parser::Permissions::Restricted)) {
+        return Err(format!("{}: Die Schrift darf nicht in Dokumente eingebettet werden.", path.display()));
+    }
+    let upem = face.units_per_em() as f64;
+    if upem <= 0.0 {
+        return Err("Schrift ohne Einheitengröße".into());
+    }
+    let k = 1000.0 / upem;
+    let mut widths = Vec::with_capacity(LAST_CHAR - FIRST_CHAR + 1);
+    for code in FIRST_CHAR..=LAST_CHAR {
+        let ch = if (0x80..=0x9F).contains(&code) { CP1252_HIGH[code - 0x80] } else { char::from(code as u8) };
+        let w = if ch == ' ' && code != 32 { 0.0 } else { face.glyph_index(ch).and_then(|g| face.glyph_hor_advance(g)).map_or(0.0, |a| a as f64 * k) };
+        widths.push(w.round() as u16);
+    }
+    let bb = face.global_bounding_box();
+    let name: String = path.file_stem().map(|s| s.to_string_lossy().chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect()).unwrap_or_default();
+    let cap = face.capital_height().map_or(DEFAULT_CAP, |c| (c as f64 / upem).clamp(0.3, 1.2));
+    let (ascent, descent) = ((face.ascender() as f64 * k).round() as i32, (face.descender() as f64 * k).round() as i32);
+    let bbox = [(bb.x_min as f64 * k).round() as i32, (bb.y_min as f64 * k).round() as i32, (bb.x_max as f64 * k).round() as i32, (bb.y_max as f64 * k).round() as i32];
+    let name = if name.is_empty() { "Normschrift".to_string() } else { name };
+    Ok(EmbeddedFont { name, data, widths, cap, ascent, descent, bbox })
+}
+
+/// Sucht eine Normschrift im Windows-Schriftenordner.
+pub fn find_standard_font() -> Option<EmbeddedFont> {
+    let dir = std::env::var_os("WINDIR").map(|w| Path::new(&w).join("Fonts"))?;
+    STANDARD_FONT_FILES.iter().find_map(|f| load_font(&dir.join(f)).ok())
+}
+
 struct Shading {
     data: Vec<u8>,
     bbox: [f64; 4],
@@ -91,6 +162,10 @@ struct Shading {
 #[derive(Default)]
 pub struct Content {
     s: String,
+    /// Festbreitenschrift (Courier) statt Helvetica
+    mono: bool,
+    /// eingebettete Schrift anstelle von Courier, wenn `mono` gesetzt ist
+    embedded: Option<EmbeddedFont>,
     shadings: Vec<Shading>,
 }
 
@@ -123,6 +198,14 @@ impl Content {
             }
             None => self.s += "[] 0 d\n",
         }
+    }
+    /// Schaltet die Schrift für die folgenden Texte um: Courier (Festbreite) oder Helvetica.
+    pub fn set_mono(&mut self, on: bool) {
+        self.mono = on;
+    }
+    /// Eingebettete Schrift (Normschrift) für Text im Modus `set_mono(true)`; None = Courier.
+    pub fn set_font(&mut self, f: Option<EmbeddedFont>) {
+        self.embedded = f;
     }
     pub fn round_joins(&mut self) {
         self.s += "1 j 1 J\n";
@@ -183,11 +266,26 @@ impl Content {
         if text.is_empty() {
             return;
         }
-        let size = font_size_for_cap(cap_h);
-        let w = text_width(text, size, bold);
+        let emb = if self.mono { self.embedded.as_ref() } else { None };
+        let size = match (self.mono, emb) {
+            (true, Some(f)) => cap_h / f.cap,
+            (true, None) => cap_h / MONO_CAP,
+            _ => font_size_for_cap(cap_h),
+        };
+        let w = match (self.mono, emb) {
+            (true, Some(f)) => f.width(text, size),
+            (true, None) => text.chars().count() as f64 * size * MONO_ADVANCE,
+            _ => text_width(text, size, bold),
+        };
         let (x0, y0) = (-ax * w, -ay * cap_h);
         let (sn, cs) = rot_deg.to_radians().sin_cos();
-        let font = if bold { "F2" } else { "F1" };
+        let font = match (self.mono, bold) {
+            (true, _) if emb.is_some() => "F5",
+            (false, false) => "F1",
+            (false, true) => "F2",
+            (true, false) => "F3",
+            (true, true) => "F4",
+        };
         let str_hex = hex(&to_cp1252(text));
         let tm = format!("{} {} {} {} {} {} Tm {} {} Td", n(cs), n(sn), n(-sn), n(cs), n(x), n(y), n(x0), n(y0));
         if halo {
@@ -256,7 +354,7 @@ fn utc_now() -> (i64, u32, u32, u32, u32, u32) {
 pub fn build(c: &Content, w: f64, h: f64, title: &str) -> Vec<u8> {
     let mut objs: Vec<Vec<u8>> = Vec::new(); // Objekt i+1 steht an Stelle i
     let nsh = c.shadings.len();
-    let first_sh = 7;
+    let first_sh = 9 + if c.embedded.is_some() { 3 } else { 0 };
     let info_id = first_sh + nsh;
     objs.push(b"<< /Type /Catalog /Pages 2 0 R >>".to_vec());
     objs.push(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec());
@@ -266,9 +364,10 @@ pub fn build(c: &Content, w: f64, h: f64, title: &str) -> Vec<u8> {
     }
     objs.push(
         format!(
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {} {}] /Contents 4 0 R /Resources << /Font << /F1 5 0 R /F2 6 0 R >> /Shading << {}>> >> >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {} {}] /Contents 4 0 R /Resources << /Font << /F1 5 0 R /F2 6 0 R /F3 7 0 R /F4 8 0 R {}>> /Shading << {}>> >> >>",
             n(w * PT),
             n(h * PT),
+            if c.embedded.is_some() { "/F5 9 0 R " } else { "" },
             shres
         )
         .into_bytes(),
@@ -281,6 +380,18 @@ pub fn build(c: &Content, w: f64, h: f64, title: &str) -> Vec<u8> {
     objs.push(st);
     objs.push(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_vec());
     objs.push(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>".to_vec());
+    objs.push(b"<< /Type /Font /Subtype /Type1 /BaseFont /Courier /Encoding /WinAnsiEncoding >>".to_vec());
+    objs.push(b"<< /Type /Font /Subtype /Type1 /BaseFont /Courier-Bold /Encoding /WinAnsiEncoding >>".to_vec());
+    if let Some(f) = &c.embedded {
+        let ws: Vec<String> = f.widths.iter().map(|w| w.to_string()).collect();
+        objs.push(format!("<< /Type /Font /Subtype /TrueType /BaseFont /{} /FirstChar {} /LastChar {} /Widths [{}] /Encoding /WinAnsiEncoding /FontDescriptor 10 0 R >>", f.name, FIRST_CHAR, LAST_CHAR, ws.join(" ")).into_bytes());
+        objs.push(format!("<< /Type /FontDescriptor /FontName /{} /Flags 32 /FontBBox [{} {} {} {}] /ItalicAngle 0 /Ascent {} /Descent {} /CapHeight {} /StemV 80 /FontFile2 11 0 R >>", f.name, f.bbox[0], f.bbox[1], f.bbox[2], f.bbox[3], f.ascent, f.descent, (f.cap * 1000.0).round() as i32).into_bytes());
+        let z = flate(&f.data);
+        let mut o = format!("<< /Filter /FlateDecode /Length {} /Length1 {} >>\nstream\n", z.len(), f.data.len()).into_bytes();
+        o.extend_from_slice(&z);
+        o.extend_from_slice(b"\nendstream");
+        objs.push(o);
+    }
     for s in &c.shadings {
         let z = flate(&s.data);
         let mut o = format!(

@@ -16,6 +16,7 @@ use crate::dxf_z;
 use crate::export::{self, Sheet};
 use crate::files;
 use crate::job::{self, Progress};
+use crate::profile::{self, ProfileDef, ProfileView, SheetFormat};
 use crate::scene;
 use crate::model::{ManualLabel, Params, Point, Polyline, Project, ProjectState, Tri, AUTO_CALC_LIMIT_POINTS, WARN_POINTS};
 use crate::render::{self, ContourStyle, FillCache, FillMode, Palette};
@@ -394,6 +395,20 @@ pub struct DgmApp {
     show_heights: bool,
     heights: Vec<(String, f64, f64, Option<f64>, f64)>,
     show_profile: bool,
+    /// Fenster „Profile“ (bemaßte Längs- und Querprofile)
+    show_profiles: bool,
+    profile_sel: usize,
+    /// Werkzeug „Profil“ legt ein Querprofil an (sonst Längsprofil)
+    profile_quer: bool,
+    /// Querprofile aus einer Achse: Abstand und halbe Breite (m)
+    profile_qs_step: f64,
+    profile_qs_half: f64,
+    /// Vergrößerung der Profilvorschau (Bildschirmpunkte je mm Papier)
+    profile_zoom: f32,
+    /// Oberfläche des zweiten Modells (Modellvergleich) für das zweite Gelände im Profil, mit Schlüssel
+    profile_second: Option<((String, usize, usize), Surface)>,
+    /// Querprofile als je eine Datei ausgeben (sonst mehrere je Blatt)
+    profile_series_single: bool,
     profile: Vec<ProfilePoint>,
     profile_step: f64,
     profile_exag: f32,
@@ -480,6 +495,14 @@ impl DgmApp {
             show_heights: false,
             heights: Vec::new(),
             show_profile: false,
+            show_profiles: false,
+            profile_sel: 0,
+            profile_quer: false,
+            profile_qs_step: 20.0,
+            profile_qs_half: 15.0,
+            profile_zoom: 2.5,
+            profile_second: None,
+            profile_series_single: false,
             profile: Vec::new(),
             profile_step: 1.0,
             profile_exag: 5.0,
@@ -1037,6 +1060,395 @@ impl DgmApp {
                 self.v3d.waters.push(crate::view3d::WaterShape { poly: w.pts.iter().map(|&i| (pr.st.points[i].x, pr.st.points[i].y)).collect(), plane });
             }
         }
+    }
+
+    /// Oberfläche des zweiten Modells bereitstellen, wenn ein Profil sie braucht.
+    fn ensure_profile_second(&mut self) {
+        let want = self.project.as_ref().map_or(false, |p| p.st.profiles.iter().any(|d| d.show_second));
+        let Some(sec) = self.cmp.second.as_ref().filter(|_| want) else {
+            self.profile_second = None;
+            return;
+        };
+        let key = (sec.label.clone(), sec.pr.st.points.len(), sec.pr.st.triangles.len());
+        if self.profile_second.as_ref().map_or(true, |(k, _)| *k != key) {
+            self.profile_second = Some((key, Surface::new(&sec.pr, false)));
+        }
+    }
+
+    /// Fenster Profile: Liste, Einstellungen, Vorschau, Ausgabe als Vektor-PDF, überhöhtes DXF und CSV.
+    fn profiles_window(&mut self, ctx: &egui::Context) {
+        if !self.show_profiles {
+            return;
+        }
+        self.ensure_profile_second();
+        let Some(pr) = &self.project else { return };
+        let before = pr.st.profiles.clone();
+        let params = pr.st.params.clone();
+        let waters = water_polys(pr);
+        let mut defs = before.clone();
+        let sel = self.profile_sel.min(defs.len().saturating_sub(1));
+        let mut new_sel = sel;
+        let mut open = true;
+        // 0 = PDF, 1 = DXF, 2 = löschen, 3 = neues Längsprofil, 4 = neues Querprofil, 5 = Querprofile aus Achse, 6 = alle Querprofile ausgeben, 7 = CSV
+        let mut act: Option<u8> = None;
+        let step = self.profile_step;
+        let surf = self.surface.as_ref();
+        let second = self.profile_second.as_ref().map(|(k, sf)| (sf, k.0.as_str()));
+        let second_loaded = self.cmp.second.is_some();
+        let ex = profile::Extras { waters: &waters, second };
+        egui::Window::new("Profile").open(&mut open).default_width(560.0).default_height(620.0).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("Neues Längsprofil…").on_hover_text("Achspunkte anklicken, rechte Maustaste beendet").clicked() {
+                    act = Some(3);
+                }
+                if ui.button("Neues Querprofil…").on_hover_text("Schnittlinie anklicken, rechte Maustaste beendet").clicked() {
+                    act = Some(4);
+                }
+            });
+            ui.separator();
+            if defs.is_empty() {
+                ui.label("Noch keine Profile. Mit „Neues Längsprofil…“ oder „Neues Querprofil…“ eine Schnittlinie im Plan anklicken.");
+                return;
+            }
+            egui::ScrollArea::vertical().max_height(110.0).id_salt("profile_list").show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for (k, d) in defs.iter().enumerate() {
+                        if ui.selectable_label(k == sel, d.title()).clicked() {
+                            new_sel = k;
+                        }
+                    }
+                });
+            });
+            ui.separator();
+            let Some(d) = defs.get_mut(sel) else { return };
+            let len = d.length();
+            egui::Grid::new("profile_form").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                ui.label("Name");
+                ui.text_edit_singleline(&mut d.name);
+                ui.end_row();
+                ui.label("Darstellung");
+                egui::ComboBox::from_id_salt("profile_view")
+                    .selected_text(if d.view == ProfileView::Laengs { "Längsprofil (Station)" } else { "Querprofil (Abstand links/rechts)" })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut d.view, ProfileView::Laengs, "Längsprofil (Station)");
+                        ui.selectable_value(&mut d.view, ProfileView::Quer, "Querprofil (Abstand links/rechts)");
+                    });
+                ui.end_row();
+                ui.label(if d.view == ProfileView::Laengs { "Station am Anfang (m)" } else { "Station des Nullpunkts (m)" });
+                ui.add(egui::DragValue::new(&mut d.start_station).speed(1.0).max_decimals(3));
+                ui.end_row();
+                if d.view == ProfileView::Quer {
+                    ui.label("Nullpunkt");
+                    ui.horizontal(|ui| {
+                        let mut mid = d.zero.is_none();
+                        if ui.checkbox(&mut mid, "Mitte").changed() {
+                            d.zero = if mid { None } else { Some(len / 2.0) };
+                        }
+                        if let Some(z) = d.zero.as_mut() {
+                            ui.add(egui::DragValue::new(z).range(0.0..=len.max(0.0)).speed(0.5).max_decimals(3).suffix(" m ab Anfang"));
+                        }
+                    });
+                    ui.end_row();
+                }
+                ui.label("Maßstab 1 :");
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(&mut d.scale_n).range(0.0..=100_000.0).speed(10.0).max_decimals(0));
+                    ui.weak("0 = automatisch");
+                });
+                ui.end_row();
+                ui.label("Überhöhung");
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(&mut d.exag).range(0.0..=200.0).speed(0.5).max_decimals(2));
+                    ui.weak("0 = automatisch");
+                });
+                ui.end_row();
+                ui.label("Beschriftung alle (m)");
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(&mut d.label_step).range(0.0..=10_000.0).speed(1.0).max_decimals(2));
+                    ui.weak("0 = automatisch");
+                });
+                ui.end_row();
+                ui.label("Koten");
+                ui.horizontal(|ui| {
+                    let mut on = !d.no_koten;
+                    if ui.checkbox(&mut on, "an Knickpunkten").changed() {
+                        d.no_koten = !on;
+                    }
+                    if on {
+                        let mut c = d.kink_clean.unwrap_or(profile::KINK_CLEAN_DEFAULT_M);
+                        if ui.add(egui::DragValue::new(&mut c).range(0.0..=1000.0).speed(0.5).max_decimals(2).prefix("Bereinigung ").suffix(" m")).on_hover_text("kleinster Abstand beschrifteter Knickpunkte; 0 = alle").changed() {
+                            d.kink_clean = Some(c);
+                        }
+                    }
+                });
+                ui.end_row();
+                ui.label("Maßkette");
+                ui.checkbox(&mut d.dim_chain, "Teilabstände zwischen den Knickpunkten (Bandzeile)");
+                ui.end_row();
+                ui.label("Höhenunterschied");
+                ui.horizontal(|ui| {
+                    let mut on = d.dim_h.is_some();
+                    if ui.checkbox(&mut on, "Maßlinie").changed() {
+                        let o = d.offset();
+                        d.dim_h = if on { Some((o, o + len)) } else { None };
+                    }
+                    if let Some((a, b)) = d.dim_h.as_mut() {
+                        let o = if d.view == ProfileView::Laengs { d.start_station } else { -d.zero.unwrap_or(len / 2.0) };
+                        ui.add(egui::DragValue::new(a).range(o..=o + len).speed(1.0).max_decimals(2).prefix("von ").suffix(" m"));
+                        ui.add(egui::DragValue::new(b).range(o..=o + len).speed(1.0).max_decimals(2).prefix("bis ").suffix(" m"));
+                    }
+                });
+                ui.end_row();
+                ui.label("Zweites Gelände");
+                ui.add_enabled_ui(second_loaded, |ui| {
+                    ui.checkbox(&mut d.show_second, "aus dem Modellvergleich (gestrichelt, eigene Bandzeile)").on_disabled_hover_text("Zuerst im Modellvergleich ein zweites Modell einlesen.");
+                });
+                ui.end_row();
+                ui.label("Blatt");
+                egui::ComboBox::from_id_salt("profile_sheet").selected_text(d.format.name()).show_ui(ui, |ui| {
+                    for f in [SheetFormat::Auto, SheetFormat::A4, SheetFormat::A3, SheetFormat::Roll] {
+                        ui.selectable_value(&mut d.format, f, f.name());
+                    }
+                });
+                ui.end_row();
+            });
+            ui.separator();
+            match surf {
+                Some(sf) => match profile::prepare(sf, d, step, &ex) {
+                    Ok((c, lay)) => {
+                        let (w, h) = lay.sheet.size();
+                        ui.label(format!(
+                            "Länge {:.2} m · Maßstab 1:{} (Höhen 1:{}, Überhöhung {}fach) · Blatt {:.0} × {:.0} mm · Beschriftung alle {} m",
+                            c.length,
+                            export::trim_num(lay.n),
+                            export::trim_num(lay.n / lay.exag),
+                            export::trim_num(lay.exag),
+                            w,
+                            h,
+                            export::trim_num(lay.label_step)
+                        ));
+                        if !lay.fits {
+                            let parts = profile::split_parts(d, c.length, &lay).len();
+                            let msg = if parts > 1 { format!("Das Profil passt nicht auf eine Rolle (4000 mm): Das PDF wird in {} Blätter geteilt.", parts) } else { "Das Profil passt nicht auf ein Blatt, auch nicht im kleinsten Maßstab.".to_string() };
+                            ui.colored_label(Color32::from_rgb(200, 60, 0), msg);
+                        }
+                        ui.add(egui::DragValue::new(&mut self.profile_zoom).range(0.3..=12.0).speed(0.05).max_decimals(2).prefix("Vorschau ").suffix(" Punkte/mm"));
+                        let (sc, origin) = profile::build_scene(&c, d, &lay, &params, false);
+                        egui::ScrollArea::both().id_salt("profile_preview").max_height(280.0).show(ui, |ui| {
+                            profile_preview(ui, &sc, origin, &lay, self.profile_zoom);
+                        });
+                    }
+                    Err(e) => {
+                        ui.colored_label(Color32::from_rgb(200, 60, 0), e);
+                    }
+                },
+                None => {
+                    ui.label("Kein Geländemodell berechnet.");
+                }
+            }
+            if d.view == ProfileView::Laengs {
+                egui::CollapsingHeader::new("Querprofile aus dieser Achse").default_open(false).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::DragValue::new(&mut self.profile_qs_step).range(0.5..=10_000.0).speed(1.0).max_decimals(2).prefix("alle ").suffix(" m"));
+                        ui.add(egui::DragValue::new(&mut self.profile_qs_half).range(0.5..=10_000.0).speed(1.0).max_decimals(2).prefix("± ").suffix(" m"));
+                        if ui.button("erzeugen").on_hover_text("senkrecht zur Achse, links und rechts je halbe Breite; höchstens 500").clicked() {
+                            act = Some(5);
+                        }
+                    });
+                });
+            }
+            ui.horizontal(|ui| {
+                if ui.button("PDF…").on_hover_text("Vektor-PDF, Normschrift (sonst Courier); zu lange Längsprofile werden auf mehrere Blätter geteilt").clicked() {
+                    act = Some(0);
+                }
+                if ui.button("DXF…").on_hover_text("überhöht, Schriftgrößen nach dem Maßstab, Textstil ISO3098").clicked() {
+                    act = Some(1);
+                }
+                if ui.button("CSV…").on_hover_text("Wertetabelle: Station, Koordinaten, Höhe, Neigung").clicked() {
+                    act = Some(7);
+                }
+                if ui.button("Löschen").clicked() {
+                    act = Some(2);
+                }
+            });
+            if defs.iter().filter(|x| x.view == ProfileView::Quer).count() > 1 {
+                ui.horizontal(|ui| {
+                    if ui.button("Alle Querprofile ausgeben (PDF und DXF)…").on_hover_text("gemeinsamer Maßstab und gemeinsame Überhöhung; Ziel: Ordner").clicked() {
+                        act = Some(6);
+                    }
+                    ui.checkbox(&mut self.profile_series_single, "je Profil eine Datei").on_hover_text("sonst mehrere Profile auf einem Blatt (A4/A3/Rolle nach der Blattwahl)");
+                });
+            }
+        });
+        self.profile_sel = new_sel;
+        if defs != before {
+            if let Some(pr) = self.project.as_mut() {
+                pr.st.profiles = defs;
+            }
+            self.dirty = true;
+        }
+        match act {
+            Some(0) => self.export_profile(sel, true),
+            Some(1) => self.export_profile(sel, false),
+            Some(2) => {
+                self.checkpoint();
+                if let Some(pr) = self.project.as_mut() {
+                    if sel < pr.st.profiles.len() {
+                        pr.st.profiles.remove(sel);
+                    }
+                }
+                self.status = "Profil gelöscht.".into();
+            }
+            Some(n @ (3 | 4)) => {
+                self.profile_quer = n == 4;
+                self.set_tool(Tool::Profile);
+            }
+            Some(5) => {
+                let made = self.project.as_ref().and_then(|pr| pr.st.profiles.get(sel)).map(|d| profile::cross_sections(&d.line, d.start_station, self.profile_qs_step, self.profile_qs_half)).unwrap_or_default();
+                if made.is_empty() {
+                    self.status = "Querprofile: Achse, Abstand und Breite prüfen.".into();
+                } else {
+                    self.checkpoint();
+                    let n = made.len();
+                    if let Some(pr) = self.project.as_mut() {
+                        pr.st.profiles.extend(made);
+                        self.profile_sel = pr.st.profiles.len() - n;
+                    }
+                    self.status = format!("{} Querprofile angelegt.", n);
+                }
+            }
+            Some(6) => self.export_all_cross_sections(),
+            Some(7) => self.export_profile_csv(sel),
+            _ => {}
+        }
+        self.show_profiles = open;
+    }
+
+    /// Alle Querprofile in einen Ordner schreiben (PDF und DXF) mit gemeinsamem Maßstab und gemeinsamer Überhöhung:
+    /// mehrere Profile je Blatt, oder je Profil eine Datei.
+    fn export_all_cross_sections(&mut self) {
+        let (Some(pr), Some(sf)) = (&self.project, &self.surface) else { return };
+        let defs: Vec<ProfileDef> = pr.st.profiles.iter().filter(|d| d.view == ProfileView::Quer).cloned().collect();
+        let waters = water_polys(pr);
+        let second = self.profile_second.as_ref().map(|(k, s)| (s, k.0.as_str()));
+        let ex = profile::Extras { waters: &waters, second };
+        let items = profile::prepare_series(sf, &defs, self.profile_step, &ex);
+        if items.is_empty() {
+            self.status = "Querprofile: keine Schnittlinie liegt im Geländemodell.".into();
+            return;
+        }
+        let Some(dir) = rfd::FileDialog::new().set_title("Ordner für die Querprofile").pick_folder() else { return };
+        let params = pr.st.params.clone();
+        let stem = self.file_stem();
+        let (n, e) = (items[0].2.n, items[0].2.exag);
+        let (mut files_done, mut failed) = (0usize, 0usize);
+        let mut write = |path: std::path::PathBuf, bytes: Result<Vec<u8>, String>| match bytes {
+            Ok(b) => {
+                if std::fs::write(path, b).is_ok() {
+                    files_done += 1;
+                } else {
+                    failed += 1;
+                }
+            }
+            Err(t) => {
+                if files::write_text(&path, &t).is_ok() {
+                    files_done += 1;
+                } else {
+                    failed += 1;
+                }
+            }
+        };
+        if self.profile_series_single {
+            for (c, d, lay) in &items {
+                let safe: String = d.name.chars().map(|ch| if ch.is_alphanumeric() { ch } else { '_' }).collect();
+                let base = dir.join(format!("{}_Querprofil_{}", stem, safe));
+                write(base.with_extension("pdf"), Ok(profile::to_pdf(c, d, lay, &params, &pr.st.name)));
+                write(base.with_extension("dxf"), Err(profile::to_dxf(c, d, lay, &params)));
+            }
+        } else {
+            let fmt = defs.first().map_or(SheetFormat::Auto, |d| d.format);
+            let pages = profile::series_pages(&items, fmt, &params, false);
+            let pages_dxf = profile::series_pages(&items, fmt, &params, true);
+            if pages.is_empty() {
+                self.status = "Querprofile: ein einzelnes Profil ist breiter als die größte Rolle.".into();
+                return;
+            }
+            for (k, (pg, pd)) in pages.iter().zip(&pages_dxf).enumerate() {
+                let base = dir.join(format!("{}_Querprofile_Blatt_{}", stem, k + 1));
+                write(base.with_extension("pdf"), Ok(profile::series_to_pdf(pg, &params, &pr.st.name)));
+                write(base.with_extension("dxf"), Err(profile::series_to_dxf(pd, &params)));
+            }
+        }
+        self.status = format!("{} Querprofile (1:{}, Überhöhung {}fach): {} Dateien nach {} geschrieben, {} fehlgeschlagen.", items.len(), group_thousands(n.round() as u64), export::trim_num(e), files_done, dir.display(), failed);
+    }
+
+    /// Wertetabelle des Profils `k` als CSV-Datei.
+    fn export_profile_csv(&mut self, k: usize) {
+        let (Some(pr), Some(sf)) = (&self.project, &self.surface) else { return };
+        let Some(def) = pr.st.profiles.get(k).cloned() else { return };
+        let c = match profile::prepare(sf, &def, self.profile_step, &profile::Extras::default()) {
+            Ok((c, _)) => c,
+            Err(e) => {
+                self.status = format!("Profil-Fehler: {}", e);
+                return;
+            }
+        };
+        let safe: String = def.name.chars().map(|ch| if ch.is_alphanumeric() { ch } else { '_' }).collect();
+        let name = format!("{}_Profil_{}.csv", self.file_stem(), safe);
+        let Some(path) = rfd::FileDialog::new().add_filter("CSV", &["csv"]).set_file_name(name).save_file() else { return };
+        self.status = match files::write_text(&path, &profile::to_csv(&c, &def)) {
+            Ok(_) => format!("CSV geschrieben: {}", path.display()),
+            Err(e) => format!("CSV-Fehler: {}", e),
+        };
+    }
+
+    /// Profil `k` als Vektor-PDF (`pdf`, zu lange Längsprofile in mehreren Blättern) oder überhöhtes DXF schreiben.
+    fn export_profile(&mut self, k: usize, pdf: bool) {
+        let (Some(pr), Some(sf)) = (&self.project, &self.surface) else {
+            self.status = "Profil-Fehler: kein Geländemodell.".into();
+            return;
+        };
+        let Some(def) = pr.st.profiles.get(k).cloned() else { return };
+        let waters = water_polys(pr);
+        let second = self.profile_second.as_ref().map(|(k, s)| (s, k.0.as_str()));
+        let ex = profile::Extras { waters: &waters, second };
+        let (c, lay) = match profile::prepare(sf, &def, self.profile_step, &ex) {
+            Ok(r) => r,
+            Err(e) => {
+                self.status = format!("Profil-Fehler: {}", e);
+                return;
+            }
+        };
+        let ext = if pdf { "pdf" } else { "dxf" };
+        let safe: String = def.name.chars().map(|ch| if ch.is_alphanumeric() { ch } else { '_' }).collect();
+        let stem = format!("{}_{}{}", self.file_stem(), if def.view == ProfileView::Laengs { "Laengsprofil" } else { "Querprofil" }, if safe.is_empty() { String::new() } else { format!("_{}", safe) });
+        let Some(path) = rfd::FileDialog::new().add_filter(ext, &[ext]).set_file_name(format!("{}.{}", stem, ext)).save_file() else { return };
+        let params = pr.st.params.clone();
+        let (w, h) = lay.sheet.size();
+        let parts = if pdf { profile::split_parts(&def, c.length, &lay) } else { vec![def.clone()] };
+        let mut res: Result<(), String> = Ok(());
+        let mut written = 0usize;
+        if pdf {
+            for (i, part) in parts.iter().enumerate() {
+                let Ok((pc, pl)) = profile::prepare(sf, part, self.profile_step, &ex) else { continue };
+                let target = if parts.len() == 1 { path.clone() } else { path.with_file_name(format!("{}_Blatt{}.pdf", path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(), i + 1)) };
+                match std::fs::write(&target, profile::to_pdf(&pc, part, &pl, &params, &pr.st.name)) {
+                    Ok(_) => written += 1,
+                    Err(e) => {
+                        res = Err(e.to_string());
+                        break;
+                    }
+                }
+            }
+        } else {
+            res = files::write_text(&path, &profile::to_dxf(&c, &def, &lay, &params)).map_err(|e| e.to_string());
+            written = 1;
+        }
+        self.status = match res {
+            Ok(_) if written > 1 => format!("PDF geschrieben: {} Blätter ab {} (1:{}, Überhöhung {}fach)", written, path.display(), group_thousands(lay.n.round() as u64), export::trim_num(lay.exag)),
+            Ok(_) => format!("{} geschrieben: {} (1:{}, Überhöhung {}fach, {:.0} × {:.0} mm)", ext.to_uppercase(), path.display(), group_thousands(lay.n.round() as u64), export::trim_num(lay.exag), w, h),
+            Err(e) => format!("{}-Fehler: {}", ext.to_uppercase(), e),
+        };
     }
 
     /// Fenster Wasserflächen: Liste, editierbare Punkttabelle, Ausreißer auf die Ebene ziehen, Protokoll.
@@ -2222,9 +2634,21 @@ impl DgmApp {
                 self.status = "Grundrisslinie gespeichert.".into();
             }
             Tool::Profile if self.pick_world.len() >= 2 => {
-                if let Some(s) = &self.surface {
+                if let (Some(s), false) = (&self.surface, self.profile_quer) {
                     self.profile = analysis::profile(s, &self.pick_world, self.profile_step);
                     self.show_profile = true;
+                }
+                if self.project.is_some() {
+                    self.checkpoint();
+                    let line = std::mem::take(&mut self.pick_world);
+                    let view = if self.profile_quer { ProfileView::Quer } else { ProfileView::Laengs };
+                    if let Some(pr) = self.project.as_mut() {
+                        let name = format!("{}", pr.st.profiles.iter().filter(|d| d.view == view).count() + 1);
+                        pr.st.profiles.push(ProfileDef { name, view, line, ..Default::default() });
+                        self.profile_sel = pr.st.profiles.len() - 1;
+                    }
+                    self.show_profiles = true;
+                    self.status = "Profil angelegt – Einstellungen und Ausgabe im Fenster „Profile“.".into();
                 }
             }
             _ => {
@@ -2523,7 +2947,17 @@ impl DgmApp {
                     ui.close();
                 }
                 if ui.button("Höhen Profile").clicked() {
+                    self.profile_quer = false;
                     self.set_tool(Tool::Profile);
+                    ui.close();
+                }
+                if ui.button("Querprofil erzeugen").on_hover_text("Schnittlinie anklicken, rechte Maustaste beendet").clicked() {
+                    self.profile_quer = true;
+                    self.set_tool(Tool::Profile);
+                    ui.close();
+                }
+                if ui.add_enabled(self.project.is_some(), egui::Button::new("Profile bemaßt (PDF/DXF)…")).clicked() {
+                    self.show_profiles = true;
                     ui.close();
                 }
                 if ui.button("Steigungen aus DGM").clicked() {
@@ -2875,7 +3309,12 @@ impl DgmApp {
                 self.set_tool(Tool::HeightPick);
                 self.show_heights = true;
             }
-            if tb(ui, self.tool == Tool::Profile, "Profil", "Längsprofil") {
+            if tb(ui, self.tool == Tool::Profile && !self.profile_quer, "Profil", "Längsprofil") {
+                self.profile_quer = false;
+                self.set_tool(Tool::Profile);
+            }
+            if tb(ui, self.tool == Tool::Profile && self.profile_quer, "Quer", "Querprofil (beliebige Schnittlinie)") {
+                self.profile_quer = true;
                 self.set_tool(Tool::Profile);
             }
             if tb(ui, self.show_3d, "3D", "Gittermodell") {
@@ -3661,6 +4100,18 @@ impl DgmApp {
                     });
                     ui.weak("Kleinster Wert 0,05 m. Bei sehr großen Gebieten wird die Maschenweite so vergröbert, dass höchstens eine Million Rasterfelder entstehen.");
                 });
+                egui::CollapsingHeader::new("Profile (PDF)").default_open(false).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Schriftdatei (TTF)");
+                        ui.text_edit_singleline(&mut p.profile_font);
+                        if ui.button("…").on_hover_text("TrueType-Schrift wählen, z. B. eine Normschrift nach ISO 3098").clicked() {
+                            if let Some(f) = rfd::FileDialog::new().add_filter("TrueType", &["ttf"]).pick_file() {
+                                p.profile_font = f.display().to_string();
+                            }
+                        }
+                    });
+                    ui.weak("Leer = Normschrift im Windows-Schriftenordner suchen (ISOCPEUR, GENISO, NLCS-ISO …); „-“ = Courier. Die Schrift wird ins PDF eingebettet, sofern ihre Lizenz es erlaubt.");
+                });
                 egui::CollapsingHeader::new("Wasserfläche").default_open(false).show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label("Farbe der Wasserflächen");
@@ -3976,6 +4427,7 @@ impl DgmApp {
         }
 
         self.water_window(ctx);
+        self.profiles_window(ctx);
 
         if self.show_bklist {
             let mut open = true;
@@ -4073,6 +4525,62 @@ impl DgmApp {
             }
         }
     }
+}
+
+/// Wasserflächen des Projekts mit Ausgleichungsebene für die Profile.
+fn water_polys(pr: &Project) -> Vec<profile::WaterPoly> {
+    let mut out = Vec::new();
+    for w in &pr.st.waters {
+        if w.pts.iter().any(|&i| i >= pr.st.points.len()) {
+            continue;
+        }
+        if let Some(plane) = water::analyze(&pr.st.points, w).fit {
+            out.push((w.pts.iter().map(|&i| (pr.st.points[i].x, pr.st.points[i].y)).collect(), plane));
+        }
+    }
+    out
+}
+
+/// Vorschau der Profilzeichnung: dieselbe Szene wie im PDF und DXF, `zoom` Bildschirmpunkte je mm Papier.
+fn profile_preview(ui: &mut Ui, sc: &scene::Scene, origin: scene::P2, lay: &profile::Layout, zoom: f32) {
+    /// Höhe der Großbuchstaben der Bildschirmschrift (Anteil der Schriftgröße)
+    const SCREEN_CAP: f32 = 0.7;
+    let (_, _, aw, ah) = lay.sheet.area();
+    let s = zoom.max(0.1);
+    let (resp, painter) = ui.allocate_painter(Vec2::new(aw as f32 * s, ah as f32 * s), Sense::hover());
+    let r = resp.rect;
+    painter.rect_filled(r, 0.0, Color32::WHITE);
+    let mm = 1000.0 / lay.n;
+    let tr = |q: scene::P2| Pos2::new(r.left() + ((q[0] - origin[0]) * mm) as f32 * s, r.bottom() - ((q[1] - origin[1]) * mm) as f32 * s);
+    let col = |c: scene::Rgb| Color32::from_rgb(c[0], c[1], c[2]);
+    for it in &sc.items {
+        match it {
+            scene::Item::Line { rgb, w_mm, pts, closed, .. } => {
+                let v: Vec<Pos2> = pts.iter().map(|&q| tr(q)).collect();
+                let st = Stroke::new((*w_mm as f32 * s).max(0.6), col(*rgb));
+                painter.add(if *closed { Shape::closed_line(v, st) } else { Shape::line(v, st) });
+            }
+            scene::Item::Circle { rgb, c, r_mm, .. } => {
+                painter.circle_filled(tr(*c), (*r_mm as f32 * s).max(1.0), col(*rgb));
+            }
+            scene::Item::Text { rgb, pos, h_mm, rot_deg, ax, ay, text, .. } => {
+                let font = FontId::monospace((*h_mm as f32 * s / SCREEN_CAP).max(5.0));
+                let at = tr(*pos);
+                if rot_deg.abs() < 1.0 {
+                    let h = if *ax < 0.25 { egui::Align::Min } else if *ax < 0.75 { egui::Align::Center } else { egui::Align::Max };
+                    let v = if *ay < 0.25 { egui::Align::Max } else if *ay < 0.75 { egui::Align::Center } else { egui::Align::Min };
+                    painter.text(at, Align2([h, v]), text, font, col(*rgb));
+                } else {
+                    // senkrecht nach oben, Anfang des Texts am Punkt, mittig zur Zeile
+                    let galley = painter.layout_no_wrap(text.clone(), font, col(*rgb));
+                    let top_left = at - Vec2::new(galley.size().y / 2.0, 0.0);
+                    painter.add(Shape::Text(egui::epaint::TextShape::new(top_left, galley, col(*rgb)).with_angle(-std::f32::consts::FRAC_PI_2)));
+                }
+            }
+            scene::Item::Mesh { .. } => {}
+        }
+    }
+    painter.rect_stroke(r, 0.0, Stroke::new(1.0, Color32::BLACK), StrokeKind::Inside);
 }
 
 fn profile_plot(ui: &mut Ui, prof: &[ProfilePoint], exag: f32) {

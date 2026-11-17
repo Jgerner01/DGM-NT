@@ -12,6 +12,7 @@ mod files;
 mod geotiff;
 mod job;
 mod model;
+mod profile;
 mod render;
 mod tin;
 mod view;

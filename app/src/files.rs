@@ -335,11 +335,13 @@ pub fn write_polylines(path: &Path, lines: &[(Vec<String>, bool)], terminate_las
 
 pub struct DxfWriter {
     s: String,
+    /// Textstil, der allen Texten zugewiesen wird (Name)
+    style: Option<String>,
 }
 
 impl DxfWriter {
     pub fn new() -> Self {
-        DxfWriter { s: String::from("0\nSECTION\n2\nENTITIES\n") }
+        DxfWriter { s: String::from("0\nSECTION\n2\nENTITIES\n"), style: None }
     }
     /// Mit Linientyp- und Ebenentabelle: alle Ebenen (Name, ACI-Farbe) stehen in der Ebenenliste des
     /// CAD-Programms, auch wenn sie noch keine Elemente enthalten.
@@ -351,7 +353,18 @@ impl DxfWriter {
             s += &format!("0\nLAYER\n2\n{}\n70\n0\n62\n{}\n6\nCONTINUOUS\n", name, aci);
         }
         s += "0\nENDTAB\n0\nENDSEC\n0\nSECTION\n2\nENTITIES\n";
-        DxfWriter { s }
+        DxfWriter { s, style: None }
+    }
+    /// Legt einen Textstil (Name, Schriftdatei, z. B. die Normschrift `isocp.shx`) an und weist ihn allen Texten zu.
+    /// Fehlt die Schrift am Zielrechner, ersetzt das CAD-Programm sie selbst. Nur mit `with_layers` benutzbar.
+    pub fn with_text_style(mut self, name: &str, font_file: &str) -> Self {
+        let tail = "0\nENDSEC\n0\nSECTION\n2\nENTITIES\n";
+        if let Some(i) = self.s.rfind(tail) {
+            let table = format!("0\nTABLE\n2\nSTYLE\n70\n1\n0\nSTYLE\n2\n{}\n70\n0\n40\n0.0\n41\n1.0\n50\n0.0\n71\n0\n42\n2.5\n3\n{}\n4\n\n0\nENDTAB\n", name, font_file);
+            self.s.insert_str(i, &table);
+            self.style = Some(name.to_string());
+        }
+        self
     }
     pub fn polyline(&mut self, layer: &str, color: i32, pts: &[[f64; 3]], closed: bool) {
         if pts.len() < 2 {
@@ -410,6 +423,9 @@ impl DxfWriter {
         self.s += &format!("0\nTEXT\n8\n{}\n", layer);
         self.color(aci, rgb);
         self.s += &format!("10\n{:.3}\n20\n{:.3}\n30\n0.0\n40\n{:.4}\n1\n{}\n50\n{:.2}\n", p[0], p[1], h, t, rot_deg);
+        if let Some(st) = self.style.clone() {
+            self.s += &format!("7\n{}\n", st);
+        }
         let h72 = if ax < 0.25 { 0 } else if ax < 0.75 { 1 } else { 2 };
         let v73 = if ay < 0.25 { 0 } else if ay < 0.75 { 2 } else { 3 };
         if h72 != 0 || v73 != 0 {

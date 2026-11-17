@@ -67,6 +67,8 @@ pub struct Params {
     pub water_rgb: [u8; 3],
     /// Maschenweite des Gittermodells (3D) in m; 0 = automatisch. Nur in der Projektdatei .dgmnt.json gespeichert
     pub mesh_width_3d: f64,
+    /// Schriftdatei (TTF) für das Profil-PDF; leer = Normschrift automatisch suchen, „-“ = Courier
+    pub profile_font: String,
 }
 
 /// Namen der Farbfelder in `Params::exp_colors` (Reihenfolge = Zeilen 43..55 der Parameterdatei).
@@ -126,6 +128,7 @@ impl Default for Params {
             max_calc_points: DEFAULT_MAX_CALC_POINTS,
             water_rgb: crate::water::DEFAULT_WATER_RGB,
             mesh_width_3d: 0.0,
+            profile_font: String::new(),
         }
     }
 }
@@ -178,6 +181,8 @@ pub struct ProjectState {
     pub inrings: Vec<Vec<usize>>,
     /// Wasserflächen (bis `water::MAX_WATERS`)
     pub waters: Vec<crate::water::Water>,
+    /// Profile (Längs- und Querprofile) mit Schnittlinie und Darstellungswünschen
+    pub profiles: Vec<crate::profile::ProfileDef>,
     pub plan_lines: Vec<Polyline>,
     pub triangles: Vec<Tri>,
     pub manual_labels: Vec<ManualLabel>,

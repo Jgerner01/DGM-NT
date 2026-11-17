@@ -500,6 +500,58 @@ impl Surface {
         None
     }
 
+    /// Parameter t (0..1) entlang der Strecke a→b (Weltkoordinaten), an denen sie Dreieckskanten schneidet.
+    /// Sortiert, ohne Doppelte; enthält 0 und 1 nicht.
+    pub fn edge_crossings(&self, a: [f64; 2], b: [f64; 2]) -> Vec<f64> {
+        let (a, b) = ([a[0] - self.ox, a[1] - self.oy], [b[0] - self.ox, b[1] - self.oy]);
+        let len = (b[0] - a[0]).hypot(b[1] - a[1]);
+        if len <= 0.0 {
+            return Vec::new();
+        }
+        // Rasterzellen entlang der Strecke (dichter als die Zellgröße), jeweils mit Nachbarzellen
+        let n = ((len / (self.cell * 0.5)).ceil() as usize).clamp(1, 200_000);
+        let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut ts: Vec<f64> = Vec::new();
+        let mut last = (i64::MIN, i64::MIN);
+        for k in 0..=n {
+            let f = k as f64 / n as f64;
+            let key = (((a[0] + (b[0] - a[0]) * f) / self.cell).floor() as i64, ((a[1] + (b[1] - a[1]) * f) / self.cell).floor() as i64);
+            if key == last {
+                continue;
+            }
+            last = key;
+            for gx in key.0 - 1..=key.0 + 1 {
+                for gy in key.1 - 1..=key.1 + 1 {
+                    let Some(c) = self.grid.get(&(gx, gy)) else { continue };
+                    for &ti in c {
+                        if !seen.insert(ti) {
+                            continue;
+                        }
+                        let t = self.tris[ti as usize];
+                        for e in 0..3 {
+                            let (p, q) = (self.pos[t[e]], self.pos[t[(e + 1) % 3]]);
+                            // Schnitt der Strecke a + s·(b−a) mit der Kante p + u·(q−p)
+                            let (d1, d2) = ((b[0] - a[0], b[1] - a[1]), (q[0] - p[0], q[1] - p[1]));
+                            let den = d1.0 * d2.1 - d1.1 * d2.0;
+                            if den.abs() < 1e-14 {
+                                continue;
+                            }
+                            let (w0, w1) = (p[0] - a[0], p[1] - a[1]);
+                            let s = (w0 * d2.1 - w1 * d2.0) / den;
+                            let u = (w0 * d1.1 - w1 * d1.0) / den;
+                            if s > 0.0 && s < 1.0 && (-1e-12..=1.0 + 1e-12).contains(&u) {
+                                ts.push(s);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        ts.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+        ts.dedup_by(|x, y| (*x - *y).abs() * len < 1e-9);
+        ts
+    }
+
     /// Height at world coordinates.
     pub fn height(&self, x: f64, y: f64) -> Option<f64> {
         let (t, b) = self.locate(x - self.ox, y - self.oy)?;

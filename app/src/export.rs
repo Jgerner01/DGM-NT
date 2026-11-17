@@ -507,7 +507,7 @@ fn legend_for(inp: &Input, analysis: bool) -> Legend {
     Legend { title: pr.st.name.clone(), blocks }
 }
 
-fn trim_num(v: f64) -> String {
+pub fn trim_num(v: f64) -> String {
     let s = format!("{:.3}", v);
     s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
@@ -535,6 +535,11 @@ fn cad_to_aci(c: i32) -> i32 {
 
 /// DXF aus der Szene: Maße in mm Papier × (N / 1000) = Meter, Ebenen und Farben aus der Parameterdatei.
 pub fn to_dxf(sc: &Scene, p: &Params, scale_n: f64) -> String {
+    to_dxf_styled(sc, p, scale_n, None)
+}
+
+/// Wie `to_dxf`; `text_style` = (Stilname, Schriftdatei) für alle Texte, z. B. die Normschrift.
+pub fn to_dxf_styled(sc: &Scene, p: &Params, scale_n: f64, text_style: Option<(&str, &str)>) -> String {
     let k = scale_n / 1000.0;
     let ln = |i: u8| p.layers[(i as usize).min(p.layers.len() - 1)].to_string();
     // Ebenentabelle: alle 13 CAD-Ebenen der Parameterdatei, Farbe nach dem Zweck der Ebene
@@ -547,6 +552,9 @@ pub fn to_dxf(sc: &Scene, p: &Params, scale_n: f64) -> String {
         }
     }
     let mut d = DxfWriter::with_layers(&table);
+    if let Some((name, font)) = text_style {
+        d = d.with_text_style(name, font);
+    }
     for it in &sc.items {
         match it {
             Item::Line { layer, rgb, cad, pts, z, closed, .. } => {
@@ -579,18 +587,21 @@ pub struct Sheet {
     pub margin: f64,
     /// zusätzlicher Streifen für die Legende: unten bei Hochformat, rechts bei Querformat
     pub strip: f64,
+    /// Blattgröße (Breite, Höhe) in mm
+    pub page: (f64, f64),
 }
 
 impl Sheet {
     pub fn new(landscape: bool) -> Self {
-        Sheet { landscape, margin: 10.0, strip: if landscape { 60.0 } else { 45.0 } }
+        let page = if landscape { (A4.1, A4.0) } else { A4 };
+        Sheet { landscape, margin: 10.0, strip: if landscape { 60.0 } else { 45.0 }, page }
+    }
+    /// Querformat-Blatt beliebiger Größe (A3, Rolle) mit Legendenstreifen rechts.
+    pub fn custom(w: f64, h: f64, strip: f64) -> Self {
+        Sheet { landscape: true, margin: 10.0, strip, page: (w, h) }
     }
     pub fn size(&self) -> (f64, f64) {
-        if self.landscape {
-            (A4.1, A4.0)
-        } else {
-            A4
-        }
+        self.page
     }
     /// Ränder (links, oben, rechts, unten)
     pub fn margins(&self) -> (f64, f64, f64, f64) {
@@ -807,6 +818,13 @@ fn scale_bar(c: &mut Content, x: f64, y: f64, n: f64, max_mm: f64) {
 /// PDF-Seite: Zeichenfläche mit Rahmen, daneben (unten bzw. rechts) Legende, Maßstab und Nordpfeil.
 /// `origin` = Weltkoordinaten der linken unteren Ecke der Zeichenfläche, `n` = Maßstabszahl.
 pub fn render_pdf(sc: &Scene, sheet: &Sheet, origin: P2, n: f64, p: &Params, project: &str) -> Vec<u8> {
+    let _ = p;
+    render_pdf_ext(sc, sheet, origin, n, project, false, Some((0.0, 1.0)), None)
+}
+
+/// Wie `render_pdf`; `mono` = Festbreitenschrift (Courier) für die Zeichnung, `north` = Nordpfeil im Streifen
+/// (None = ohne, z. B. bei Profilen), `font` = eingebettete Schrift anstelle von Courier.
+pub fn render_pdf_ext(sc: &Scene, sheet: &Sheet, origin: P2, n: f64, project: &str, mono: bool, north: Option<(f64, f64)>, font: Option<&pdf::EmbeddedFont>) -> Vec<u8> {
     let (w, h) = sheet.size();
     let (ax, ay, aw, ah) = sheet.area();
     let mm = 1000.0 / n; // mm je m
@@ -817,6 +835,8 @@ pub fn render_pdf(sc: &Scene, sheet: &Sheet, origin: P2, n: f64, p: &Params, pro
     // ---- Zeichenfläche
     c.save();
     c.clip_rect(ax, ay, aw, ah);
+    c.set_mono(mono);
+    c.set_font(font.cloned());
     for it in &sc.items {
         match it {
             Item::Line { rgb, w_mm, pts, closed, dash, .. } => {
@@ -842,17 +862,17 @@ pub fn render_pdf(sc: &Scene, sheet: &Sheet, origin: P2, n: f64, p: &Params, pro
         }
     }
     c.restore();
+    c.set_mono(false);
     c.dash(None);
     c.stroke_color(BLACK);
     c.line_width(0.5);
     c.rect(ax, ay, aw, ah, false, true);
-    draw_strip(&mut c, sheet, n, project, &sc.legend, (0.0, 1.0));
-    let _ = p;
+    draw_strip(&mut c, sheet, n, project, &sc.legend, north);
     pdf::build(&c, w, h, &format!("{} – Druckausgabe", project))
 }
 
 /// Streifen für Legende, Maßstab und Nordpfeil. `north` = Richtung des Nordpfeils auf dem Blatt (x nach rechts, y nach oben).
-fn draw_strip(c: &mut Content, sheet: &Sheet, n: f64, project: &str, lg: &Legend, north: (f64, f64)) {
+fn draw_strip(c: &mut Content, sheet: &Sheet, n: f64, project: &str, lg: &Legend, north: Option<(f64, f64)>) {
     let (sx, sy, sw, sh) = sheet.strip_rect();
     c.stroke_color([150, 150, 150]);
     c.line_width(0.2);
@@ -876,7 +896,9 @@ fn draw_strip(c: &mut Content, sheet: &Sheet, n: f64, project: &str, lg: &Legend
             }
         }
         let cx = sx + sw / 2.0;
-        north_arrow(c, cx, sy + 44.0, 12.0, north);
+        if let Some(nd) = north {
+            north_arrow(c, cx, sy + 44.0, 12.0, nd);
+        }
         c.text(cx, sy + 30.0, 2.8, true, BLACK, 0.0, 0.5, 0.0, &info[0].0, false);
         c.text(cx, sy + 25.0, 2.1, false, BLACK, 0.0, 0.5, 0.0, &info[1].0, false);
         scale_bar(c, sx + pad + 2.0, sy + 14.0, n, (sw - 2.0 * pad - 6.0).min(45.0));
@@ -922,7 +944,9 @@ fn draw_strip(c: &mut Content, sheet: &Sheet, n: f64, project: &str, lg: &Legend
             c.polyline(&[(x, sy + 2.0), (x, sy + sh - 2.0)], false);
         }
         let wc = sw - wa - wb - 2.0 * pad;
-        north_arrow(c, xc + wc - 8.0, sy + sh - 14.0, 12.0, north);
+        if let Some(nd) = north {
+            north_arrow(c, xc + wc - 8.0, sy + sh - 14.0, 12.0, nd);
+        }
         c.text(xc, sy + sh - 6.0, 2.8, true, BLACK, 0.0, 0.0, 0.0, &info[0].0, false);
         c.text(xc, sy + sh - 11.0, 2.1, false, BLACK, 0.0, 0.0, 0.0, &info[1].0, false);
         scale_bar(c, xc + 1.0, sy + 12.0, n, (wc - 6.0).min(40.0));
@@ -1000,7 +1024,7 @@ pub fn render_pdf_3d(quads: &[ProjQuad], pan: (f64, f64), wire: bool, legend: &L
     c.stroke_color(BLACK);
     c.line_width(0.5);
     c.rect(ax, ay, aw, ah, false, true);
-    draw_strip(&mut c, sheet, n, project, legend, north);
+    draw_strip(&mut c, sheet, n, project, legend, Some(north));
     pdf::build(&c, w, h, &format!("{} – Gittermodell", project))
 }
 

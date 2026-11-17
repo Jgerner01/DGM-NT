@@ -859,7 +859,7 @@ checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
 name = "dgm-nt"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "eframe",
  "egui",
@@ -871,6 +871,7 @@ dependencies = [
  "serde_json",
  "spade",
  "tiff",
+ "ttf-parser",
  "winresource",
 ]
 
