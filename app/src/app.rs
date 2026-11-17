@@ -161,6 +161,79 @@ impl Tool {
 }
 
 /// Druckausgabe (PDF): Blattformat und Maßstab
+/// Linienbreite und Endpunktradius des gewählten Profils in der Karte (Bildschirmpunkte)
+const PROFILE_LINE_W: f32 = 3.0;
+const PROFILE_END_R: f32 = 5.0;
+/// Farbe der Vorschau der Querprofile in der Karte
+const QS_PREVIEW_RGB: Color32 = Color32::from_rgb(0, 70, 230);
+/// Strichmuster (Bildschirmpunkte, abwechselnd Strich/Lücke): gestrichelt und strichpunktiert
+const QS_DASH: [f32; 2] = [8.0, 5.0];
+const QS_DASH_DOT: [f32; 4] = [14.0, 4.0, 2.0, 4.0];
+
+/// Linienzug mit Strichmuster (abwechselnd Strich- und Lückenlänge) als Einzelstücke.
+fn dash_pattern(pts: &[Pos2], stroke: Stroke, pattern: &[f32]) -> Vec<Shape> {
+    let mut out = Vec::new();
+    if pts.len() < 2 || pattern.is_empty() {
+        return out;
+    }
+    let (mut idx, mut left) = (0usize, pattern[0]);
+    let mut cur: Vec<Pos2> = vec![pts[0]];
+    for w in pts.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        let len = (b - a).length();
+        if len <= 0.0 {
+            continue;
+        }
+        let mut pos = 0.0;
+        while len - pos > left {
+            pos += left;
+            let q = a + (b - a) * (pos / len);
+            if idx % 2 == 0 {
+                cur.push(q);
+                out.push(Shape::line(std::mem::take(&mut cur), stroke));
+            } else {
+                cur = vec![q];
+            }
+            idx += 1;
+            left = pattern[idx % pattern.len()];
+        }
+        left -= len - pos;
+        if idx % 2 == 0 {
+            cur.push(b);
+        }
+    }
+    if idx % 2 == 0 && cur.len() >= 2 {
+        out.push(Shape::line(cur, stroke));
+    }
+    out
+}
+
+/// Kleinster Abstand und kleinste Breite der Querprofile (m)
+const QS_STEP_MIN_M: f64 = 0.5;
+
+/// Maske „Querprofile erzeugen“ zu einem Längsprofil.
+struct QsDialog {
+    /// Index des Längsprofils
+    axis: usize,
+    /// Profile an den Achspunkten statt im festen Abstand
+    at_vertices: bool,
+    step: f64,
+    half: f64,
+    n: f64,
+    exag: f64,
+    /// Maßstab bzw. Überhöhung vom Benutzer gesetzt (kein automatischer Vorschlag mehr)
+    n_user: bool,
+    e_user: bool,
+    /// Vorschau und Vorschlag müssen neu berechnet werden
+    pending: bool,
+    /// entstehende Querprofile (am Modellrand beschnitten), für die Vorschau in der Karte
+    made: Vec<ProfileDef>,
+    /// Achse des gewählten Längsprofils (Vorschau)
+    axis_pts: Vec<[f64; 2]>,
+    /// mögliche Abstände zur Auswahl
+    steps: Vec<f64>,
+}
+
 struct PrintState {
     open: bool,
     landscape: bool,
@@ -400,9 +473,8 @@ pub struct DgmApp {
     profile_sel: usize,
     /// Werkzeug „Profil“ legt ein Querprofil an (sonst Längsprofil)
     profile_quer: bool,
-    /// Querprofile aus einer Achse: Abstand und halbe Breite (m)
-    profile_qs_step: f64,
-    profile_qs_half: f64,
+    /// Maske „Querprofile erzeugen“ (offen, solange sie Werte enthält)
+    qs_dialog: Option<QsDialog>,
     /// Vergrößerung der Profilvorschau (Bildschirmpunkte je mm Papier)
     profile_zoom: f32,
     /// Oberfläche des zweiten Modells (Modellvergleich) für das zweite Gelände im Profil, mit Schlüssel
@@ -498,8 +570,7 @@ impl DgmApp {
             show_profiles: false,
             profile_sel: 0,
             profile_quer: false,
-            profile_qs_step: 20.0,
-            profile_qs_half: 15.0,
+            qs_dialog: None,
             profile_zoom: 2.5,
             profile_second: None,
             profile_series_single: false,
@@ -1115,6 +1186,9 @@ impl DgmApp {
                     for (k, d) in defs.iter().enumerate() {
                         if ui.selectable_label(k == sel, d.title()).clicked() {
                             new_sel = k;
+                            if d.view == ProfileView::Laengs {
+                                act = Some(5);
+                            }
                         }
                     }
                 });
@@ -1247,15 +1321,9 @@ impl DgmApp {
                 }
             }
             if d.view == ProfileView::Laengs {
-                egui::CollapsingHeader::new("Querprofile aus dieser Achse").default_open(false).show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.add(egui::DragValue::new(&mut self.profile_qs_step).range(0.5..=10_000.0).speed(1.0).max_decimals(2).prefix("alle ").suffix(" m"));
-                        ui.add(egui::DragValue::new(&mut self.profile_qs_half).range(0.5..=10_000.0).speed(1.0).max_decimals(2).prefix("± ").suffix(" m"));
-                        if ui.button("erzeugen").on_hover_text("senkrecht zur Achse, links und rechts je halbe Breite; höchstens 500").clicked() {
-                            act = Some(5);
-                        }
-                    });
-                });
+                if ui.button("Querprofile aus dieser Achse erzeugen…").on_hover_text("Abstand, Maßstab und Überhöhung der Querprofile festlegen").clicked() {
+                    act = Some(5);
+                }
             }
             ui.horizontal(|ui| {
                 if ui.button("PDF…").on_hover_text("Vektor-PDF, Normschrift (sonst Courier); zu lange Längsprofile werden auf mehrere Blätter geteilt").clicked() {
@@ -1303,25 +1371,202 @@ impl DgmApp {
                 self.profile_quer = n == 4;
                 self.set_tool(Tool::Profile);
             }
-            Some(5) => {
-                let made = self.project.as_ref().and_then(|pr| pr.st.profiles.get(sel)).map(|d| profile::cross_sections(&d.line, d.start_station, self.profile_qs_step, self.profile_qs_half)).unwrap_or_default();
-                if made.is_empty() {
-                    self.status = "Querprofile: Achse, Abstand und Breite prüfen.".into();
-                } else {
-                    self.checkpoint();
-                    let n = made.len();
-                    if let Some(pr) = self.project.as_mut() {
-                        pr.st.profiles.extend(made);
-                        self.profile_sel = pr.st.profiles.len() - n;
-                    }
-                    self.status = format!("{} Querprofile angelegt.", n);
-                }
-            }
+            Some(5) => self.open_qs_dialog(new_sel),
             Some(6) => self.export_all_cross_sections(),
             Some(7) => self.export_profile_csv(sel),
             _ => {}
         }
         self.show_profiles = open;
+    }
+
+    /// Öffnet die Maske für die Querprofile des Längsprofils `k` mit den Werten aus den Parametern.
+    fn open_qs_dialog(&mut self, k: usize) {
+        let Some(pr) = &self.project else { return };
+        let p = &pr.st.params;
+        self.qs_dialog = Some(QsDialog {
+            axis: k,
+            at_vertices: false,
+            step: p.qs_step,
+            half: p.qs_half,
+            n: p.qs_scale_n,
+            exag: p.qs_exag,
+            n_user: p.qs_scale_n > 0.0,
+            e_user: p.qs_exag > 0.0,
+            pending: true,
+            made: Vec::new(),
+            axis_pts: Vec::new(),
+            steps: Vec::new(),
+        });
+    }
+
+    /// Querprofile der Maske neu bestimmen (am Modellrand beschnitten) und Vorschlag für Maßstab und Überhöhung ermitteln.
+    fn qs_refresh(&self, d: &mut QsDialog) {
+        d.made.clear();
+        d.axis_pts.clear();
+        d.steps.clear();
+        let (Some(pr), Some(sf)) = (self.project.as_ref(), self.surface.as_ref()) else { return };
+        let Some(axis) = pr.st.profiles.get(d.axis) else { return };
+        d.axis_pts = axis.line.clone();
+        let total = profile::axis_length(&axis.line);
+        d.steps = profile::possible_steps(total);
+        let stations = if d.at_vertices { profile::vertex_stations(&axis.line) } else { profile::regular_stations(total, d.step) };
+        d.made = profile::cross_sections_at(&axis.line, axis.start_station, &stations, d.half).into_iter().filter_map(|m| profile::clip_to_model(sf, m)).collect();
+        if d.made.is_empty() {
+            return;
+        }
+        let waters = water_polys(pr);
+        let ex = profile::Extras { waters: &waters, second: None };
+        if let Some((n, e, _)) = profile::common_layout(sf, &d.made, self.profile_step, &ex) {
+            if !d.n_user {
+                d.n = n;
+            }
+            if !d.e_user {
+                d.exag = e;
+            }
+        }
+    }
+
+    /// Maske „Querprofile erzeugen“: Lage (frei oder an den Achspunkten), Abstand, Maßstab und Überhöhung, vorbelegt mit
+    /// dem Vorschlag. Die Lage der Profile zeigt die Karte schon während der Eingabe.
+    fn qs_dialog_window(&mut self, ctx: &egui::Context) {
+        let Some(mut d) = self.qs_dialog.take() else { return };
+        // Vorschlag erst berechnen, wenn nicht mehr gezogen wird
+        if d.pending && !ctx.input(|i| i.pointer.any_down()) {
+            self.qs_refresh(&mut d);
+            d.pending = false;
+        }
+        let axes: Vec<(usize, String)> = self.project.as_ref().map(|pr| pr.st.profiles.iter().enumerate().filter(|(_, x)| x.view == ProfileView::Laengs).map(|(i, x)| (i, x.title())).collect()).unwrap_or_default();
+        let mut open = true;
+        let (mut create, mut suggest, mut cancel, mut load) = (false, false, false, false);
+        egui::Window::new("Querprofile erzeugen").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
+            egui::Grid::new("qs_form").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                ui.label("Längsprofil (Achse)");
+                ui.horizontal(|ui| {
+                    let sel = axes.iter().find(|(i, _)| *i == d.axis).map_or("–".to_string(), |(_, t)| t.clone());
+                    egui::ComboBox::from_id_salt("qs_axis").selected_text(sel).show_ui(ui, |ui| {
+                        for (i, t) in &axes {
+                            if ui.selectable_value(&mut d.axis, *i, t).changed() {
+                                d.pending = true;
+                            }
+                        }
+                    });
+                    if ui.button("Laden…").on_hover_text("Achse aus einer Textdatei (je Zeile x y) als Längsprofil laden").clicked() {
+                        load = true;
+                    }
+                });
+                ui.end_row();
+                ui.label("Lage der Profile");
+                ui.horizontal(|ui| {
+                    let free = ui.radio_value(&mut d.at_vertices, false, "frei (Abstand)").changed();
+                    let verts = ui.radio_value(&mut d.at_vertices, true, "an den Achspunkten").changed();
+                    if free || verts {
+                        d.pending = true;
+                    }
+                });
+                ui.end_row();
+                if !d.at_vertices {
+                    ui.label("Abstand der Profile");
+                    if ui.add(egui::DragValue::new(&mut d.step).range(QS_STEP_MIN_M..=10_000.0).speed(1.0).max_decimals(2).suffix(" m")).changed() {
+                        d.pending = true;
+                    }
+                    ui.end_row();
+                }
+                ui.label("Breite links/rechts");
+                if ui.add(egui::DragValue::new(&mut d.half).range(QS_STEP_MIN_M..=10_000.0).speed(1.0).max_decimals(2).prefix("± ").suffix(" m")).changed() {
+                    d.pending = true;
+                }
+                ui.end_row();
+                ui.label("Maßstab 1 :");
+                if ui.add(egui::DragValue::new(&mut d.n).range(0.0..=100_000.0).speed(10.0).max_decimals(0)).changed() {
+                    d.n_user = true;
+                }
+                ui.end_row();
+                ui.label("Überhöhung");
+                if ui.add(egui::DragValue::new(&mut d.exag).range(0.0..=200.0).speed(0.5).max_decimals(2)).changed() {
+                    d.e_user = true;
+                }
+                ui.end_row();
+            });
+            if !d.at_vertices && !d.steps.is_empty() {
+                ui.label(format!("Mögliche Abstände (Achslänge {} m):", export::trim_num((profile::axis_length(&d.axis_pts) * 100.0).round() / 100.0)));
+                ui.horizontal_wrapped(|ui| {
+                    for st in d.steps.clone() {
+                        if ui.selectable_label((d.step - st).abs() < 1e-9, format!("{} m", export::trim_num(st))).clicked() {
+                            d.step = st;
+                            d.pending = true;
+                        }
+                    }
+                });
+            }
+            ui.weak(format!(
+                "{} Querprofile (höchstens {}), am Modellrand beschnitten. In der Karte: Achse blau strichpunktiert, Querprofile blau gestrichelt. 0 = Maßstab/Überhöhung automatisch je Profil.",
+                d.made.len(),
+                profile::MAX_CROSS_SECTIONS
+            ));
+            ui.horizontal(|ui| {
+                if ui.add_enabled(!d.made.is_empty(), egui::Button::new("OK – Querprofile erzeugen")).clicked() {
+                    create = true;
+                }
+                if ui.button("Vorschlag neu ermitteln").on_hover_text("Maßstab und Überhöhung aus dem Gelände entlang der Querprofile").clicked() {
+                    suggest = true;
+                }
+                if ui.button("Abbrechen").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+        if load {
+            self.load_axis_profile(&mut d);
+        }
+        if suggest {
+            d.n_user = false;
+            d.e_user = false;
+            d.pending = true;
+        }
+        if create && !d.made.is_empty() {
+            self.checkpoint();
+            let made = std::mem::take(&mut d.made);
+            let n = made.len();
+            if let Some(pr) = self.project.as_mut() {
+                pr.st.profiles.extend(made.into_iter().map(|mut m| {
+                    m.scale_n = d.n;
+                    m.exag = d.exag;
+                    m
+                }));
+                self.profile_sel = pr.st.profiles.len() - n;
+            }
+            self.dirty = true;
+            self.status = format!("{} Querprofile angelegt.", n);
+            return;
+        }
+        if open && !cancel {
+            self.qs_dialog = Some(d);
+        }
+    }
+
+    /// Längsprofil aus einer Textdatei (je Zeile x y) laden und in der Maske als Achse wählen.
+    fn load_axis_profile(&mut self, d: &mut QsDialog) {
+        let Some(path) = rfd::FileDialog::new().set_title("Längsprofil laden").add_filter("Text / CSV", &["txt", "csv", "xyz", "asc", "dat"]).pick_file() else { return };
+        let axis = match files::read_text(&path) {
+            Ok(t) => profile::parse_axis(&t),
+            Err(e) => {
+                self.status = format!("Längsprofil: {}", e);
+                return;
+            }
+        };
+        if axis.len() < 2 {
+            self.status = "Längsprofil: Die Datei enthält weniger als zwei Punkte (je Zeile x y).".into();
+            return;
+        }
+        self.checkpoint();
+        let name = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        if let Some(pr) = self.project.as_mut() {
+            pr.st.profiles.push(ProfileDef { name, view: ProfileView::Laengs, line: axis, ..Default::default() });
+            d.axis = pr.st.profiles.len() - 1;
+        }
+        self.dirty = true;
+        d.pending = true;
+        self.status = format!("Längsprofil geladen: {}", path.display());
     }
 
     /// Alle Querprofile in einen Ordner schreiben (PDF und DXF) mit gemeinsamem Maßstab und gemeinsamer Überhöhung:
@@ -2648,6 +2893,10 @@ impl DgmApp {
                         self.profile_sel = pr.st.profiles.len() - 1;
                     }
                     self.show_profiles = true;
+                    if view == ProfileView::Laengs {
+                        let k = self.project.as_ref().map_or(0, |pr| pr.st.profiles.len().saturating_sub(1));
+                        self.open_qs_dialog(k);
+                    }
                     self.status = "Profil angelegt – Einstellungen und Ausgabe im Fenster „Profile“.".into();
                 }
             }
@@ -3580,6 +3829,26 @@ impl DgmApp {
                     painter.extend(Shape::dashed_line(&[sp(last), h], Stroke::new(1.5, pick_col), 6.0, 4.0));
                 }
             }
+            if self.show_profiles {
+                if let Some(d) = pr.st.profiles.get(self.profile_sel) {
+                    let pts: Vec<Pos2> = d.line.iter().map(|p| self.view.to_screen(rect, p[0], p[1])).collect();
+                    let col = Color32::from_rgb(200, 0, 120);
+                    painter.add(Shape::line(pts.clone(), Stroke::new(PROFILE_LINE_W, col)));
+                    if let (Some(&first), Some(&last)) = (pts.first(), pts.last()) {
+                        painter.circle_filled(first, PROFILE_END_R, col);
+                        painter.circle_stroke(last, PROFILE_END_R, Stroke::new(2.0, col));
+                        render::halo_text(&painter, first + Vec2::new(10.0, -10.0), Align2::LEFT_BOTTOM, &d.title(), 13.0, col, Color32::WHITE);
+                    }
+                }
+            }
+            if let Some(q) = &self.qs_dialog {
+                let blue = Stroke::new(1.8, QS_PREVIEW_RGB);
+                let scr = |l: &[[f64; 2]]| -> Vec<Pos2> { l.iter().map(|p| self.view.to_screen(rect, p[0], p[1])).collect() };
+                for m in &q.made {
+                    painter.extend(dash_pattern(&scr(&m.line), blue, &QS_DASH));
+                }
+                painter.extend(dash_pattern(&scr(&q.axis_pts), Stroke::new(2.4, QS_PREVIEW_RGB), &QS_DASH_DOT));
+            }
             if !self.pick_world.is_empty() {
                 let mut pts: Vec<Pos2> = self.pick_world.iter().map(|p| self.view.to_screen(rect, p[0], p[1])).collect();
                 if let Some(h) = resp.hover_pos() {
@@ -3801,7 +4070,7 @@ impl DgmApp {
             for (bi, b) in pr.st.breaklines.iter().enumerate() {
                 let pts: Vec<Pos2> = b.pts.iter().map(|&i| v.to_screen(rect, pr.st.points[i].x, pr.st.points[i].y)).collect();
                 let hl = blink == Some(bi);
-                let stroke = Stroke::new(if hl { 5.0 } else { 2.0 }, if hl { Color32::from_rgb(255, 0, 200) } else { pal.breakline });
+                let stroke = Stroke::new(if hl { 5.0 } else { 2.0 }, if hl { Color32::from_rgb(255, 0, 200) } else { Color32::from_rgb(pr.st.params.break_rgb[0], pr.st.params.break_rgb[1], pr.st.params.break_rgb[2]) });
                 if b.soft {
                     painter.extend(Shape::dashed_line(&pts, stroke, 7.0, 4.0));
                 } else {
@@ -4111,6 +4380,33 @@ impl DgmApp {
                         }
                     });
                     ui.weak("Leer = Normschrift im Windows-Schriftenordner suchen (ISOCPEUR, GENISO, NLCS-ISO …); „-“ = Courier. Die Schrift wird ins PDF eingebettet, sofern ihre Lizenz es erlaubt.");
+                });
+                egui::CollapsingHeader::new("Querprofile (aus Längsprofil)").default_open(false).show(ui, |ui| {
+                    egui::Grid::new("qs_params").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                        ui.label("Abstand der Profile (m)");
+                        ui.add(egui::DragValue::new(&mut p.qs_step).range(QS_STEP_MIN_M..=10_000.0).speed(1.0).max_decimals(2));
+                        ui.end_row();
+                        ui.label("Breite links/rechts (± m)");
+                        ui.add(egui::DragValue::new(&mut p.qs_half).range(QS_STEP_MIN_M..=10_000.0).speed(1.0).max_decimals(2));
+                        ui.end_row();
+                        ui.label("Maßstab 1 : (0 = Vorschlag)");
+                        ui.add(egui::DragValue::new(&mut p.qs_scale_n).range(0.0..=100_000.0).speed(10.0).max_decimals(0));
+                        ui.end_row();
+                        ui.label("Überhöhung (0 = Vorschlag)");
+                        ui.add(egui::DragValue::new(&mut p.qs_exag).range(0.0..=200.0).speed(0.5).max_decimals(2));
+                        ui.end_row();
+                    });
+                    ui.weak("Vorbelegung der Maske, die nach dem Anlegen eines Längsprofils erscheint. Maßstab und Überhöhung 0 = aus dem Gelände ermittelt.");
+                });
+                egui::CollapsingHeader::new("Bruchkanten").default_open(false).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Farbe der Bruchkanten");
+                        ui.color_edit_button_srgb(&mut p.break_rgb);
+                        if ui.button("Grün").on_hover_text("Standardfarbe wiederherstellen").clicked() {
+                            p.break_rgb = crate::model::DEFAULT_BREAK_RGB;
+                        }
+                    });
+                    ui.weak("Gilt für die Karte und das PDF. Im DXF bestimmt die CAD-Farbnummer „Bruchkanten“ (Standard 2 = grün) im Abschnitt Export. Gespeichert in der Projektdatei (.dgmnt.json).");
                 });
                 egui::CollapsingHeader::new("Wasserfläche").default_open(false).show(ui, |ui| {
                     ui.horizontal(|ui| {
@@ -4428,6 +4724,7 @@ impl DgmApp {
 
         self.water_window(ctx);
         self.profiles_window(ctx);
+        self.qs_dialog_window(ctx);
 
         if self.show_bklist {
             let mut open = true;

@@ -67,9 +67,26 @@ pub struct Params {
     pub water_rgb: [u8; 3],
     /// Maschenweite des Gittermodells (3D) in m; 0 = automatisch. Nur in der Projektdatei .dgmnt.json gespeichert
     pub mesh_width_3d: f64,
+    /// Farbe der Bruchkanten (RGB) in Karte und PDF; im DXF gilt die CAD-Farbnummer. Nur in der Projektdatei .dgmnt.json gespeichert
+    pub break_rgb: [u8; 3],
     /// Schriftdatei (TTF) für das Profil-PDF; leer = Normschrift automatisch suchen, „-“ = Courier
     pub profile_font: String,
+    /// Querprofile aus einem Längsprofil: Abstand der Profile (m)
+    pub qs_step: f64,
+    /// Querprofile aus einem Längsprofil: halbe Breite links und rechts der Achse (m)
+    pub qs_half: f64,
+    /// Querprofile aus einem Längsprofil: Maßstabszahl N (1:N); 0 = Vorschlag aus dem Gelände
+    pub qs_scale_n: f64,
+    /// Querprofile aus einem Längsprofil: Überhöhung; 0 = Vorschlag aus dem Gelände
+    pub qs_exag: f64,
 }
+
+/// Standardfarbe der Bruchkanten: Grün
+pub const DEFAULT_BREAK_RGB: [u8; 3] = [0, 150, 0];
+/// Standardabstand der Querprofile (m)
+pub const QS_STEP_DEFAULT_M: f64 = 10.0;
+/// Standardwert der halben Querprofilbreite (m)
+pub const QS_HALF_DEFAULT_M: f64 = 15.0;
 
 /// Namen der Farbfelder in `Params::exp_colors` (Reihenfolge = Zeilen 43..55 der Parameterdatei).
 pub const EXP_COLOR_NAMES: [&str; 13] = [
@@ -124,11 +141,16 @@ impl Default for Params {
             exp_text_grid_mm: 2.0,
             // dgm.sys: Punkte 1, Nummern 1, Höhe 6, Umring 5, Höhenlinien 2, Zähllinien 3, Bruchkanten 11,
             // Gitter 4, Dreiecke 6, Grundriss 7; dazu Abtrag 9, Auftrag 12, Schnittkante 7
-            exp_colors: [1, 1, 6, 5, 2, 3, 11, 4, 6, 7, 9, 12, 7],
+            exp_colors: [1, 1, 6, 5, 2, 3, 2, 4, 6, 7, 9, 12, 7],
             max_calc_points: DEFAULT_MAX_CALC_POINTS,
             water_rgb: crate::water::DEFAULT_WATER_RGB,
             mesh_width_3d: 0.0,
+            break_rgb: DEFAULT_BREAK_RGB,
             profile_font: String::new(),
+            qs_step: QS_STEP_DEFAULT_M,
+            qs_half: QS_HALF_DEFAULT_M,
+            qs_scale_n: 0.0,
+            qs_exag: 0.0,
         }
     }
 }

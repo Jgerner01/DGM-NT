@@ -41,6 +41,23 @@ pub mod layer {
     pub const FILL: u8 = 12;
 }
 
+/// Namen der Ebenen für die PDF-Ebenen (Reihenfolge wie `layer`).
+pub const LAYER_NAMES: [&str; 13] = [
+    "Punkte",
+    "Gitter",
+    "Punktnummern",
+    "Punkthöhen",
+    "Umring und Inringe",
+    "Höhenlinien",
+    "Zähllinien",
+    "Grundriss",
+    "Linienbeschriftung",
+    "Bruchkanten",
+    "Abtrag und Auftrag",
+    "Dreiecke",
+    "Farbflächen und Wasser",
+];
+
 #[derive(Clone, Debug)]
 pub enum Item {
     Line { layer: u8, rgb: Rgb, cad: i32, w_mm: f64, pts: Vec<P2>, z: f64, closed: bool, dash: bool },
@@ -70,6 +87,16 @@ pub struct Legend {
 pub struct Scene {
     pub items: Vec<Item>,
     pub legend: Legend,
+    /// eigene Ebenennamen (Index = `layer`); leer = `LAYER_NAMES`
+    pub names: &'static [&'static str],
+}
+
+impl Item {
+    pub fn layer(&self) -> u8 {
+        match self {
+            Item::Line { layer, .. } | Item::Circle { layer, .. } | Item::Text { layer, .. } | Item::Mesh { layer, .. } => *layer,
+        }
+    }
 }
 
 pub fn bbox_hits(a: [f64; 4], b: [f64; 4]) -> bool {

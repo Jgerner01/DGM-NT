@@ -31,14 +31,17 @@ const SHEET_MARGIN_MM: f64 = 10.0;
 const STRIP_MM: f64 = 60.0;
 /// Breite der Spalte mit den Zeilenköpfen und der Höhenskala (mm)
 const HEAD_W_MM: f64 = 32.0;
-/// Abstand zwischen Spalte und Profilbeginn (mm)
-const PAD_LEFT_MM: f64 = 4.0;
-/// Abstand zwischen Profilende und rechtem Rand der Zeichenfläche (mm)
-const PAD_RIGHT_MM: f64 = 6.0;
+/// Abstand zwischen Spalte und Profilbeginn (mm); mindestens die halbe Breite des längsten Bandtexts (2,5 mm Courier,
+/// „12+345.67“), damit die Beschriftung am Anfang nicht in die Zeilenköpfe ragt
+const PAD_LEFT_MM: f64 = 13.0;
+/// Abstand zwischen Profilende und rechtem Rand der Zeichenfläche (mm), aus demselben Grund
+const PAD_RIGHT_MM: f64 = 13.0;
 /// Höhe einer Bandzeile (mm)
 const BAND_ROW_MM: f64 = 8.0;
 /// Höhe des Titelbereichs oben (mm)
 const TITLE_H_MM: f64 = 16.0;
+/// Abstand zwischen Bandoberkante und Bezugslinie (mm): die Profilgrafik steht um diesen Betrag höher
+const GRAPH_LIFT_MM: f64 = 20.0;
 /// freier Platz über dem höchsten Punkt (mm), Platz für die senkrecht stehenden Koten
 const TOP_PAD_MM: f64 = 20.0;
 /// Mindestabstand zweier Beschriftungsstationen (mm): Breite von „0+120.00“ in 2,5 mm Courier plus Luft
@@ -87,6 +90,24 @@ const MONO_CAP: f64 = 0.562;
 const MONO_ADVANCE: f64 = 0.6;
 /// Höchstzahl der Querprofile, die aus einer Achse entstehen
 pub const MAX_CROSS_SECTIONS: usize = 500;
+/// Ebenennamen der Profile im PDF (Index = Ebene der Szene; die Ebenen der Karte sind hier umgewidmet)
+const PROFILE_LAYER_NAMES: [&str; 13] = [
+    "Punkte",
+    "Rahmen und Raster",
+    "Punktnummern",
+    "Band, Koten und Maße",
+    "Umring und Inringe",
+    "Gelände",
+    "Bezugslinie",
+    "Grundriss",
+    "Beschriftung",
+    "Bruchkanten",
+    "Zweites Gelände",
+    "Dreiecke",
+    "Wasserspiegel",
+];
+/// Mindestkürzung, ab der eine Schnittlinie am Modellrand beschnitten wird (m)
+const CLIP_EPS_M: f64 = 1e-6;
 /// Textstil der Normschrift im DXF (Name und Schriftdatei, DIN EN ISO 3098)
 pub const DXF_STYLE_NAME: &str = "ISO3098";
 pub const DXF_STYLE_FONT: &str = "isocp.shx";
@@ -451,7 +472,7 @@ fn grid_step_for(k: f64) -> f64 {
 fn try_fit(def: &ProfileDef, fmt: SheetFormat, n: f64, length: f64, zmin: f64, zmax: f64, rows: usize) -> Option<Layout> {
     let area_w = HEAD_W_MM + PAD_LEFT_MM + length * 1000.0 / n + PAD_RIGHT_MM;
     let page = page_of(fmt, area_w)?;
-    let avail = page.1 - 2.0 * SHEET_MARGIN_MM - TITLE_H_MM - band_height(rows) - TOP_PAD_MM;
+    let avail = page.1 - 2.0 * SHEET_MARGIN_MM - TITLE_H_MM - band_height(rows) - GRAPH_LIFT_MM - TOP_PAD_MM;
     // Längsprofile: größte passende Überhöhung, Querprofile: kleinste (bevorzugt 1)
     let mut exags: Vec<f64> = if def.exag > 0.0 {
         vec![def.exag]
@@ -516,7 +537,7 @@ pub fn label_positions(d0: f64, d1: f64, step: f64, min_gap: f64, extra: Option<
         out.push(d1);
     }
     if let Some(x) = extra {
-        if x > d0 + 1e-9 && x < d1 - 1e-9 {
+        if x > d0 + min_gap * 0.999 && x < d1 - min_gap * 0.999 {
             out.push(x);
         }
     }
@@ -568,12 +589,20 @@ pub fn key_points(run: &[CutPt], min_gap: f64) -> Vec<CutPt> {
 /// Winkelhalbierenden), je `half_width` m links und rechts. Die Schnittlinie läuft von links nach rechts,
 /// der Nullpunkt liegt auf der Achse. Höchstens `MAX_CROSS_SECTIONS`.
 pub fn cross_sections(axis: &[[f64; 2]], start_station: f64, step: f64, half_width: f64) -> Vec<ProfileDef> {
-    let mut out = Vec::new();
-    let total: f64 = axis.windows(2).map(|w| (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1])).sum();
-    if axis.len() < 2 || total <= 0.0 || step <= 0.0 || half_width <= 0.0 {
-        return out;
-    }
+    cross_sections_at(axis, start_station, &regular_stations(axis_length(axis), step), half_width)
+}
+
+/// Länge einer Achse (m).
+pub fn axis_length(axis: &[[f64; 2]]) -> f64 {
+    axis.windows(2).map(|w| (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1])).sum()
+}
+
+/// Stationen (Länge ab Achsanfang) alle `step` m und am Ende, höchstens `MAX_CROSS_SECTIONS`.
+pub fn regular_stations(total: f64, step: f64) -> Vec<f64> {
     let mut stations: Vec<f64> = Vec::new();
+    if total <= 0.0 || step <= 0.0 {
+        return stations;
+    }
     let mut s = 0.0;
     while s < total - 1e-9 && stations.len() < MAX_CROSS_SECTIONS {
         stations.push(s);
@@ -582,7 +611,91 @@ pub fn cross_sections(axis: &[[f64; 2]], start_station: f64, step: f64, half_wid
     if stations.len() < MAX_CROSS_SECTIONS {
         stations.push(total);
     }
-    for st in stations {
+    stations
+}
+
+/// Stationen der Achspunkte (Knicke und Enden) einer Achse, höchstens `MAX_CROSS_SECTIONS`.
+pub fn vertex_stations(axis: &[[f64; 2]]) -> Vec<f64> {
+    let mut out = vec![0.0];
+    let mut acc = 0.0;
+    for w in axis.windows(2) {
+        let d = (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1]);
+        if d > 0.0 {
+            acc += d;
+            out.push(acc);
+        }
+    }
+    out.truncate(MAX_CROSS_SECTIONS);
+    if out.len() < 2 {
+        out.clear();
+    }
+    out
+}
+
+/// Mögliche Abstände der Querprofile für eine Achse der Länge `total`: runde Werte (1-2-5-Reihe), die
+/// mindestens 2 und höchstens `MAX_CROSS_SECTIONS` Profile ergeben.
+pub fn possible_steps(total: f64) -> Vec<f64> {
+    let mut out = Vec::new();
+    let mut decade = 0.01;
+    while decade <= total.max(1.0) {
+        for m in [1.0, 2.0, 5.0] {
+            let st = decade * m;
+            let count = (total / st).ceil() + 1.0;
+            if st < total && count <= MAX_CROSS_SECTIONS as f64 {
+                out.push(st);
+            }
+        }
+        decade *= 10.0;
+    }
+    out
+}
+
+/// Schneidet eine Schnittlinie auf den Teil im Geländemodell zu; der Nullpunkt bleibt an seiner Stelle.
+/// `None`, wenn die Linie das Modell nicht trifft.
+pub fn clip_to_model(sf: &Surface, mut def: ProfileDef) -> Option<ProfileDef> {
+    let len = def.length();
+    let c = cut(sf, &def.line, 0.0);
+    let s0 = c.runs.first()?.first()?.s;
+    let s1 = c.runs.last()?.last()?.s;
+    if s1 - s0 < MIN_PIECE_M {
+        return None;
+    }
+    if s0 > CLIP_EPS_M || s1 < len - CLIP_EPS_M {
+        let zero = def.zero.unwrap_or(len / 2.0);
+        def.line = sub_line(&def.line, s0, s1);
+        def.zero = Some((zero - s0).clamp(0.0, s1 - s0));
+    }
+    Some(def)
+}
+
+/// Achse aus einer Textdatei: je Zeile ein Punkt `x y` (Trenner Leerzeichen, Tabulator, Semikolon oder Komma,
+/// Dezimalkomma erlaubt); Zeilen ohne zwei Zahlen am Anfang (z. B. Kopfzeilen) werden übersprungen.
+pub fn parse_axis(text: &str) -> Vec<[f64; 2]> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let semi = line.contains(';') || line.contains('\t');
+        let nums: Vec<f64> = line
+            .split(|c: char| c == ';' || c == '\t' || (!semi && (c == ' ' || c == ',')))
+            .map(|t| t.trim())
+            .filter(|t| !t.is_empty())
+            .map(|t| t.replace(',', ".").parse::<f64>())
+            .take_while(|r| r.is_ok())
+            .filter_map(|r| r.ok())
+            .collect();
+        if nums.len() >= 2 {
+            out.push([nums[0], nums[1]]);
+        }
+    }
+    out
+}
+
+/// Querprofile an den angegebenen Stationen der Achse (siehe `cross_sections`).
+pub fn cross_sections_at(axis: &[[f64; 2]], start_station: f64, stations: &[f64], half_width: f64) -> Vec<ProfileDef> {
+    let mut out = Vec::new();
+    if axis.len() < 2 || half_width <= 0.0 {
+        return out;
+    }
+    for &st in stations {
         // Segment, in dem die Station liegt, und Richtung (am Knick: Mittel aus beiden Richtungen)
         let mut acc = 0.0;
         let mut dir = (1.0, 0.0);
@@ -663,6 +776,8 @@ pub fn build_scene(cut: &Cut, def: &ProfileDef, lay: &Layout, p: &Params, dxf: b
     let k = lay.k();
     let rows = band_rows(def, !cut.second.is_empty());
     let band = band_height(rows.len());
+    // Grundlinie der Grafik (Bezugshöhe) über dem Band
+    let base = band + GRAPH_LIFT_MM;
     // Profilebene: Papier-mm (von der linken unteren Ecke der Zeichenfläche) → Ebene
     let ox = off - (HEAD_W_MM + PAD_LEFT_MM) * mm_m;
     let oy = -band * mm_m;
@@ -720,7 +835,7 @@ pub fn build_scene(cut: &Cut, def: &ProfileDef, lay: &Layout, p: &Params, dxf: b
     let mut z = lay.datum;
     let mut guard = 0;
     while z <= lay.top + lay.grid_dz * 0.01 && guard < 10_000 {
-        let y_mm = band + (z - lay.datum) * k;
+        let y_mm = base + (z - lay.datum) * k;
         if y_mm <= top_mm - TEXT_LABEL_MM - 3.0 {
             line(&mut items, layer::GRID, slot::GRID, RGB_GRID, W_GRID, vec![[fx(HEAD_W_MM), fy(y_mm)], [fx(x_right_mm), fy(y_mm)]]);
             text(&mut items, layer::HEIGHTS, slot::HEIGHT, [fx(HEAD_W_MM - 1.5), fy(y_mm)], TEXT_DIM_MM, 1.0, 0.5, format!("{:.*}", dec, z));
@@ -735,38 +850,38 @@ pub fn build_scene(cut: &Cut, def: &ProfileDef, lay: &Layout, p: &Params, dxf: b
     let stations = label_positions(d0, d1, lay.label_step, min_gap, extra);
     for &v in &stations {
         let s = v - off;
-        let y_end = cut.z_at(s).map_or(band, |zz| band + (zz - lay.datum) * k);
+        let y_end = cut.z_at(s).map_or(base, |zz| base + (zz - lay.datum) * k);
         line(&mut items, layer::GRID, slot::GRID, RGB_GRID, W_GRID, vec![[v, fy(0.0)], [v, fy(y_end.min(top_mm))]]);
     }
 
     // ---- Gelände
     for r in &cut.runs {
-        let pts: Vec<P2> = r.iter().map(|q| [q.s + off, fy(band) + yz(q.z)]).collect();
+        let pts: Vec<P2> = r.iter().map(|q| [q.s + off, fy(base) + yz(q.z)]).collect();
         line(&mut items, layer::CONTOUR, slot::CONTOUR, RGB_TERRAIN, W_TERRAIN, pts);
     }
 
     // ---- zweites Gelände (gestrichelt)
     for r in &cut.second {
-        let pts: Vec<P2> = r.iter().map(|q| [q.s + off, fy(band) + yz(q.z)]).collect();
+        let pts: Vec<P2> = r.iter().map(|q| [q.s + off, fy(base) + yz(q.z)]).collect();
         let (rgb, cad) = col(slot::CUT, RGB_SECOND);
         items.push(Item::Line { layer: layer::DIFF, rgb, cad, w_mm: W_TERRAIN, pts, z: 0.0, closed: false, dash: true });
     }
 
     // ---- Wasserspiegel (Ausgleichungsebene der Wasserfläche) mit Beschriftung
     for wseg in &cut.waters {
-        let pts: Vec<P2> = wseg.iter().map(|&(sv, z)| [sv + off, fy(band) + yz(z)]).collect();
+        let pts: Vec<P2> = wseg.iter().map(|&(sv, z)| [sv + off, fy(base) + yz(z)]).collect();
         let (rgb, cad) = col(slot::FILL, p.water_rgb);
         items.push(Item::Line { layer: layer::FILL, rgb, cad, w_mm: W_TERRAIN, pts, z: 0.0, closed: false, dash: false });
         let len_mm = (wseg[1].0 - wseg[0].0) * 1000.0 / lay.n;
         let zm = (wseg[0].1 + wseg[1].1) / 2.0;
-        let y_mm = band + (zm - lay.datum) * k + KOTE_LIFT_MM;
+        let y_mm = base + (zm - lay.datum) * k + KOTE_LIFT_MM;
         if len_mm >= WATER_LABEL_MIN_MM && y_mm + TEXT_DIM_MM <= top_mm - 1.0 {
             items.push(Item::Text { layer: layer::FILL, rgb, cad, pos: [(wseg[0].0 + wseg[1].0) / 2.0 + off, fy(y_mm)], h_mm: TEXT_DIM_MM, rot_deg: 0.0, ax: 0.5, ay: 0.0, text: format!("WSP {:.2}", zm), halo: false });
         }
     }
 
     // ---- Bezugslinie
-    line(&mut items, layer::INDEX, slot::INDEX, RGB_BLACK, W_DATUM, vec![[fx(HEAD_W_MM), fy(band)], [fx(x_right_mm), fy(band)]]);
+    line(&mut items, layer::INDEX, slot::INDEX, RGB_BLACK, W_DATUM, vec![[fx(HEAD_W_MM), fy(base)], [fx(x_right_mm), fy(base)]]);
 
     // ---- Koten an den Knickpunkten (Höhe senkrecht über dem Gelände), Bereinigung wie im LBB-Leitfaden
     if !def.no_koten {
@@ -774,7 +889,7 @@ pub fn build_scene(cut: &Cut, def: &ProfileDef, lay: &Layout, p: &Params, dxf: b
         let kote_w = |t: &str| t.chars().count() as f64 * TEXT_DIM_MM / MONO_CAP * MONO_ADVANCE;
         for r in &cut.runs {
             for kp in key_points(r, clean) {
-                let y_mm = band + (kp.z - lay.datum) * k;
+                let y_mm = base + (kp.z - lay.datum) * k;
                 let label = format!("{:.2}", kp.z);
                 let (rgb, cad) = col(slot::HEIGHT, RGB_BLACK);
                 items.push(Item::Circle { layer: layer::HEIGHTS, rgb, cad, c: [kp.s + off, fy(y_mm)], r_mm: KOTE_MARK_R_MM });
@@ -788,7 +903,7 @@ pub fn build_scene(cut: &Cut, def: &ProfileDef, lay: &Layout, p: &Params, dxf: b
     // ---- Höhenunterschied-Maßlinie zwischen zwei Stationen
     if let Some((da, db)) = def.dim_h {
         if let (Some(za), Some(zb)) = (cut.z_at(da - off), cut.z_at(db - off)) {
-            let (ya, yb) = (band + (za - lay.datum) * k, band + (zb - lay.datum) * k);
+            let (ya, yb) = (base + (za - lay.datum) * k, base + (zb - lay.datum) * k);
             if ya.max(yb) + 1.0 <= top_mm - 1.0 {
                 let (rgb, cad) = col(slot::HEIGHT, RGB_BLACK);
                 let ln = |items: &mut Vec<Item>, pts: Vec<P2>, dash: bool| items.push(Item::Line { layer: layer::HEIGHTS, rgb, cad, w_mm: W_BAND, pts, z: 0.0, closed: false, dash });
@@ -917,7 +1032,7 @@ pub fn build_scene(cut: &Cut, def: &ProfileDef, lay: &Layout, p: &Params, dxf: b
         lines.push(("Achtung: passt nicht auf ein Blatt".into(), true));
     }
     let legend = Legend { title: def.title(), blocks: vec![Block::Lines(lines)] };
-    (Scene { items, legend }, origin)
+    (Scene { items, legend, names: &PROFILE_LAYER_NAMES }, origin)
 }
 
 /// Geländeschnitt und Layout eines Profils (mit Wasserspiegel und zweitem Gelände, soweit gewünscht).
@@ -1052,7 +1167,7 @@ pub fn series_pages(items: &[(Cut, ProfileDef, Layout)], format: SheetFormat, p:
     for (c, d, l) in items {
         let rows = band_rows(d, !c.second.is_empty()).len();
         cell_w = cell_w.max(HEAD_W_MM + PAD_LEFT_MM + c.length * 1000.0 / n + PAD_RIGHT_MM);
-        cell_h = cell_h.max(TITLE_H_MM + band_height(rows) + (l.top - l.datum) * l.k() + TOP_PAD_MM);
+        cell_h = cell_h.max(TITLE_H_MM + band_height(rows) + GRAPH_LIFT_MM + (l.top - l.datum) * l.k() + TOP_PAD_MM);
     }
     let (extra_w, extra_h) = (2.0 * SHEET_MARGIN_MM + STRIP_MM, 2.0 * SHEET_MARGIN_MM);
     let grid = |w: f64, h: f64| -> (usize, usize) { (((w - extra_w + CELL_GAP_MM) / (cell_w + CELL_GAP_MM)).floor().max(0.0) as usize, ((h - extra_h + CELL_GAP_MM) / (cell_h + CELL_GAP_MM)).floor().max(0.0) as usize) };
@@ -1113,7 +1228,7 @@ pub fn series_pages(items: &[(Cut, ProfileDef, Layout)], format: SheetFormat, p:
             (format!("Beschriftung alle {} m", export::trim_num(first.2.label_step)), false),
         ];
         let legend = Legend { title: format!("Profile {}", first.1.title()), blocks: vec![Block::Lines(lines)] };
-        pages.push(SeriesPage { scene: Scene { items: sc_items, legend }, sheet, n, count: take });
+        pages.push(SeriesPage { scene: Scene { items: sc_items, legend, names: &PROFILE_LAYER_NAMES }, sheet, n, count: take });
         idx += take;
     }
     pages
@@ -1213,6 +1328,23 @@ mod tests {
     }
 
     #[test]
+    fn clip_to_model_trims_lines_that_leave_the_model() {
+        let (pr, s) = demo();
+        let b = pr.bbox().unwrap();
+        let ym = (b[1] + b[3]) / 2.0;
+        let xm = (b[0] + b[2]) / 2.0;
+        // Linie ragt links und rechts weit über das Modell hinaus, Nullpunkt in der Mitte
+        let wide = ProfileDef { view: ProfileView::Quer, line: vec![[b[0] - 500.0, ym], [b[2] + 500.0, ym]], ..Default::default() };
+        let len = wide.length();
+        let c = clip_to_model(&s, wide).expect("trifft das Modell");
+        assert!(c.length() < len - 500.0);
+        assert!((c.line[0][0] + c.zero.unwrap() - xm).abs() < 1e-6, "Nullpunkt bleibt an seiner Stelle");
+        assert!(c.line[0][0] >= b[0] - 1e-6 && c.line.last().unwrap()[0] <= b[2] + 1e-6);
+        let away = ProfileDef { line: vec![[b[0] - 900.0, ym], [b[0] - 500.0, ym]], ..Default::default() };
+        assert!(clip_to_model(&s, away).is_none());
+    }
+
+    #[test]
     fn cut_outside_the_model_is_empty() {
         let (pr, s) = demo();
         let b = pr.bbox().unwrap();
@@ -1302,7 +1434,7 @@ mod tests {
                 if *l == layer::CONTOUR && *w_mm == W_TERRAIN {
                     for q in pts {
                         let y = (q[1] - o[1]) * mm;
-                        assert!(y >= band_height(lay.rows) - 1e-6 && y <= ah - TITLE_H_MM, "Gelände y = {}", y);
+                        assert!(y >= band_height(lay.rows) + GRAPH_LIFT_MM - 1e-6 && y <= ah - TITLE_H_MM, "Gelände y = {}", y);
                     }
                 }
             }
@@ -1323,6 +1455,18 @@ mod tests {
         // gerade Strecke: nur Anfang und Ende
         let line = vec![mk(0.0, 0.0), mk(5.0, 1.0), mk(10.0, 2.0)];
         assert_eq!(key_points(&line, 0.0).len(), 2);
+    }
+
+    #[test]
+    fn possible_steps_stations_and_axis_parsing() {
+        let st = possible_steps(100.0);
+        assert!(st.contains(&10.0) && st.contains(&50.0) && !st.contains(&100.0));
+        assert!(st.iter().all(|s| (100.0 / s).ceil() + 1.0 <= MAX_CROSS_SECTIONS as f64));
+        let axis = [[0.0, 0.0], [30.0, 0.0], [30.0, 40.0]];
+        assert_eq!(vertex_stations(&axis), vec![0.0, 30.0, 70.0]);
+        assert_eq!(regular_stations(25.0, 10.0), vec![0.0, 10.0, 20.0, 25.0]);
+        let a = parse_axis("x;y\n1,5;2,5\n3 4 9\n# Kommentar\n5\t6\n");
+        assert_eq!(a, vec![[1.5, 2.5], [3.0, 4.0], [5.0, 6.0]]);
     }
 
     #[test]
@@ -1458,7 +1602,7 @@ mod tests {
         let (pr, s) = demo();
         let b = pr.bbox().unwrap();
         let axis = [[b[0] + 60.0, (b[1] + b[3]) / 2.0 - 30.0], [b[0] + 160.0, (b[1] + b[3]) / 2.0 - 30.0]];
-        let defs = cross_sections(&axis, 0.0, 20.0, 15.0);
+        let defs = cross_sections(&axis, 0.0, 20.0, 5.0);
         assert_eq!(defs.len(), 6);
         let items = prepare_series(&s, &defs, 1.0, &Extras::default());
         assert_eq!(items.len(), 6);
@@ -1513,6 +1657,52 @@ mod tests {
                 let f5 = fonts.get(&b"F5"[..]).expect("F5 vorhanden");
                 assert_eq!(f5.get(b"Subtype").unwrap().as_name().unwrap(), b"TrueType");
                 assert!(f5.get(b"FontDescriptor").is_ok());
+            }
+        }
+    }
+
+    /// Breite eines Textes in Courier (mm), die ungünstigste der verwendeten Schriften
+    fn courier_w(t: &str, cap: f64) -> f64 {
+        t.chars().count() as f64 * cap / MONO_CAP * MONO_ADVANCE
+    }
+
+    #[test]
+    fn band_texts_do_not_overlap_each_other_or_the_row_heads() {
+        let (pr, s) = demo();
+        for view in [ProfileView::Laengs, ProfileView::Quer] {
+            for step in [0.0, 5.0, 50.0] {
+                let mut def = line_across(&pr, 0.0);
+                def.view = view;
+                def.label_step = step;
+                def.dim_chain = true;
+                let (c, lay) = prepare(&s, &def, 1.0, &Extras::default()).unwrap();
+                let (sc, o) = build_scene(&c, &def, &lay, &pr.st.params, false);
+                let mm = 1000.0 / lay.n;
+                let (_, _, aw, _) = lay.sheet.area();
+                // Texte des Bands: waagrecht, 2,5 mm, unterhalb der Bandoberkante
+                let band = band_height(lay.rows);
+                let mut boxes: Vec<(f64, f64, f64, String)> = Vec::new(); // (x von, x bis, y, Text)
+                for it in &sc.items {
+                    if let Item::Text { pos, h_mm, rot_deg, text, .. } = it {
+                        let (x, y) = ((pos[0] - o[0]) * mm, (pos[1] - o[1]) * mm);
+                        if *rot_deg == 0.0 && *h_mm == TEXT_DIM_MM && y < band {
+                            let w = courier_w(text, *h_mm);
+                            boxes.push((x - w / 2.0, x + w / 2.0, y, text.clone()));
+                        }
+                    }
+                }
+                assert!(!boxes.is_empty());
+                for b in &boxes {
+                    assert!(b.0 >= HEAD_W_MM, "{:?} {}: Text „{}“ ragt in die Zeilenköpfe (x ab {:.1} mm)", view, step, b.3, b.0);
+                    assert!(b.1 <= aw, "{:?} {}: Text „{}“ ragt über den rechten Rand ({:.1} > {:.1} mm)", view, step, b.3, b.1, aw);
+                }
+                for (i, a) in boxes.iter().enumerate() {
+                    for b in &boxes[i + 1..] {
+                        if (a.2 - b.2).abs() < 1e-6 {
+                            assert!(a.1 <= b.0 + 1e-9 || b.1 <= a.0 + 1e-9, "{:?} {}: „{}“ und „{}“ überlappen", view, step, a.3, b.3);
+                        }
+                    }
+                }
             }
         }
     }

@@ -402,7 +402,7 @@ pub fn build(inp: &Input) -> Scene {
         }
     }
     if l.breaklines {
-        let (rgb, cad) = col.get(slot::BREAK, pal.breakline);
+        let (rgb, cad) = col.get(slot::BREAK, Color32::from_rgb(p.break_rgb[0], p.break_rgb[1], p.break_rgb[2]));
         for b in &pr.st.breaklines {
             let pts: Vec<P2> = b.pts.iter().map(|&i| pt(i)).collect();
             if bbox_hits(pts_bbox(&pts), reg) {
@@ -837,7 +837,9 @@ pub fn render_pdf_ext(sc: &Scene, sheet: &Sheet, origin: P2, n: f64, project: &s
     c.clip_rect(ax, ay, aw, ah);
     c.set_mono(mono);
     c.set_font(font.cloned());
+    let names: &[&str] = if sc.names.is_empty() { &LAYER_NAMES } else { sc.names };
     for it in &sc.items {
+        c.layer(names.get(it.layer() as usize).copied());
         match it {
             Item::Line { rgb, w_mm, pts, closed, dash, .. } => {
                 let v: Vec<(f64, f64)> = pts.iter().map(|&q| tr(q)).collect();
@@ -861,6 +863,7 @@ pub fn render_pdf_ext(sc: &Scene, sheet: &Sheet, origin: P2, n: f64, project: &s
             }
         }
     }
+    c.layer(None);
     c.restore();
     c.set_mono(false);
     c.dash(None);
@@ -1211,13 +1214,16 @@ mod pdf_parser_tests {
                     "c" | "cm" | "Tm" => 6,
                     "rg" | "RG" => 3,
                     "w" | "j" | "J" | "Tr" => 1,
-                    "d" | "Tf" => 2,
+                    "d" | "Tf" | "BDC" => 2,
                     "Tj" | "sh" => 1,
-                    "q" | "Q" | "W" | "n" | "S" | "s" | "f" | "B" | "BT" | "ET" => 0,
+                    "q" | "Q" | "W" | "n" | "S" | "s" | "f" | "B" | "BT" | "ET" | "EMC" => 0,
                     _ => return None,
                 })
             };
             let (mut q, mut bt) = (0i32, 0i32);
+            // Ebenen (BDC/EMC) dürfen nicht über q/Q-Grenzen hinweg laufen
+            let mut open_layer: Option<i32> = None;
+            let mut layer_names = std::collections::BTreeSet::new();
             for o in &ops {
                 let n = need(&o.operator).unwrap_or_else(|| panic!("unbekannte Operation {}", o.operator));
                 assert_eq!(o.operands.len(), n, "Operandenzahl von {}", o.operator);
@@ -1226,11 +1232,26 @@ mod pdf_parser_tests {
                     "Q" => q -= 1,
                     "BT" => bt += 1,
                     "ET" => bt -= 1,
+                    "BDC" => {
+                        assert!(open_layer.is_none(), "Ebenen nicht verschachtelt");
+                        open_layer = Some(q);
+                        layer_names.insert(format!("{:?}", o.operands[1]));
+                    }
+                    "EMC" => {
+                        assert_eq!(open_layer.take(), Some(q), "EMC auf derselben q-Stufe wie BDC");
+                    }
                     _ => {}
                 }
                 assert!(q >= 0 && (0..=1).contains(&bt));
             }
             assert_eq!((q, bt), (0, 0), "q/Q und BT/ET ausgewogen");
+            assert!(open_layer.is_none(), "alle Ebenen geschlossen");
+            // jede benutzte Ebene ist als Optional Content Group im Katalog verzeichnet
+            let root = doc.catalog().unwrap();
+            let ocp = root.get(b"OCProperties").unwrap().as_dict().unwrap();
+            let ocgs = ocp.get(b"OCGs").unwrap().as_array().unwrap();
+            assert!(ocgs.len() >= 3 && ocgs.len() == layer_names.len(), "{} Ebenen im Katalog, {} im Inhalt", ocgs.len(), layer_names.len());
+            assert!(ocgs.iter().all(|r| doc.get_dictionary(r.as_reference().unwrap()).unwrap().get(b"Type").unwrap().as_name().unwrap() == b"OCG"));
             // Shadings (Farbflächen) liegen als Typ-4-Netze vor und lassen sich entpacken
             let mut shadings = 0;
             for (_, obj) in doc.objects.iter() {

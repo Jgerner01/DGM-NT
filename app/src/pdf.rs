@@ -167,9 +167,36 @@ pub struct Content {
     /// eingebettete Schrift anstelle von Courier, wenn `mono` gesetzt ist
     embedded: Option<EmbeddedFont>,
     shadings: Vec<Shading>,
+    /// Namen der PDF-Ebenen (Optional Content Groups) in der Reihenfolge ihres ersten Auftretens
+    layers: Vec<String>,
+    /// gerade geöffnete Ebene (Index in `layers`)
+    open_layer: Option<usize>,
 }
 
 impl Content {
+    /// Folgende Zeichenbefehle gehören zur Ebene `name`; `None` beendet die Ebene.
+    /// Aufeinanderfolgende Aufrufe mit demselben Namen bleiben in einem Abschnitt.
+    pub fn layer(&mut self, name: Option<&str>) {
+        let want = name.map(|nm| match self.layers.iter().position(|l| l == nm) {
+            Some(i) => i,
+            None => {
+                self.layers.push(nm.to_string());
+                self.layers.len() - 1
+            }
+        });
+        if want == self.open_layer {
+            return;
+        }
+        if self.open_layer.is_some() {
+            self.s += "EMC
+";
+        }
+        if let Some(i) = want {
+            let _ = writeln!(self.s, "/OC /OC{} BDC", i + 1);
+        }
+        self.open_layer = want;
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -355,20 +382,36 @@ pub fn build(c: &Content, w: f64, h: f64, title: &str) -> Vec<u8> {
     let mut objs: Vec<Vec<u8>> = Vec::new(); // Objekt i+1 steht an Stelle i
     let nsh = c.shadings.len();
     let first_sh = 9 + if c.embedded.is_some() { 3 } else { 0 };
-    let info_id = first_sh + nsh;
-    objs.push(b"<< /Type /Catalog /Pages 2 0 R >>".to_vec());
+    let nly = c.layers.len();
+    let first_ocg = first_sh + nsh;
+    let info_id = first_ocg + nly;
+    if nly == 0 {
+        objs.push(b"<< /Type /Catalog /Pages 2 0 R >>".to_vec());
+    } else {
+        let refs: Vec<String> = (0..nly).map(|i| format!("{} 0 R", first_ocg + i)).collect();
+        objs.push(format!("<< /Type /Catalog /Pages 2 0 R /OCProperties << /OCGs [{}] /D << /Order [{}] /ListMode /AllPages >> >> >>", refs.join(" "), refs.join(" ")).into_bytes());
+    }
     objs.push(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec());
     let mut shres = String::new();
     for i in 0..nsh {
         let _ = write!(shres, "/Sh{} {} 0 R ", i + 1, first_sh + i);
     }
+    let mut props = String::new();
+    if nly > 0 {
+        props.push_str("/Properties << ");
+        for i in 0..nly {
+            let _ = write!(props, "/OC{} {} 0 R ", i + 1, first_ocg + i);
+        }
+        props.push_str(">> ");
+    }
     objs.push(
         format!(
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {} {}] /Contents 4 0 R /Resources << /Font << /F1 5 0 R /F2 6 0 R /F3 7 0 R /F4 8 0 R {}>> /Shading << {}>> >> >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {} {}] /Contents 4 0 R /Resources << /Font << /F1 5 0 R /F2 6 0 R /F3 7 0 R /F4 8 0 R {}>> /Shading << {}>> {}>> >>",
             n(w * PT),
             n(h * PT),
             if c.embedded.is_some() { "/F5 9 0 R " } else { "" },
-            shres
+            shres,
+            props
         )
         .into_bytes(),
     );
@@ -406,6 +449,9 @@ pub fn build(c: &Content, w: f64, h: f64, title: &str) -> Vec<u8> {
         o.extend_from_slice(&z);
         o.extend_from_slice(b"\nendstream");
         objs.push(o);
+    }
+    for name in &c.layers {
+        objs.push(format!("<< /Type /OCG /Name {} >>", utf16_hex(name)).into_bytes());
     }
     let (y, mo, d, hh, mi, ss) = utc_now();
     objs.push(format!("<< /Title {} /Creator {} /Producer (DGM-NT) /CreationDate (D:{:04}{:02}{:02}{:02}{:02}{:02}Z) >>", utf16_hex(title), utf16_hex("DGM-NT"), y, mo, d, hh, mi, ss).into_bytes());

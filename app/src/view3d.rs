@@ -136,7 +136,7 @@ impl View3d {
         let base = Self::base_scale(rect.size(), g);
         if resp.dragged_by(PointerButton::Primary) {
             let d = resp.drag_delta();
-            self.azimuth -= d.x * 0.01;
+            self.azimuth += d.x * 0.01;
             self.elevation = (self.elevation + d.y * 0.01).clamp(0.05, 1.5);
         } else if resp.dragged_by(PointerButton::Secondary) || resp.dragged_by(PointerButton::Middle) {
             let d = resp.drag_delta();
@@ -290,7 +290,8 @@ impl View3d {
             let (dx, dy, dz) = (x - cx, y - cy, (z - zc) * ex);
             let rx = dx * ca - dy * sa;
             let ry = dx * sa + dy * ca;
-            (rx, ry * se - dz * ce, -(ry * ce + dz * se))
+            // u wird negiert: Blick aus Norden nach Süden, Osten liegt dann links (rechtshändige Ansicht, nicht gespiegelt)
+            (-rx, ry * se - dz * ce, -(ry * ce + dz * se))
         }
     }
 
@@ -313,7 +314,7 @@ impl View3d {
     /// Richtung nach Norden in der Ansicht (x nach rechts, y nach oben) für den Nordpfeil.
     pub fn north_dir(&self) -> (f64, f64) {
         let (sa, ca) = (self.azimuth.sin() as f64, self.azimuth.cos() as f64);
-        (-sa, -ca * self.elevation.sin() as f64)
+        (sa, -ca * self.elevation.sin() as f64)
     }
 
     /// Alle Rasterfelder mit Schattierung, von hinten nach vorn sortiert (Malerverfahren).
