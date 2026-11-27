@@ -29,3 +29,7 @@ desktop.ini
 
 # fertige Programmdatei (wird als Release-Datei angehängt, nicht eingecheckt)
 /dist/
+
+# lokale Kopie der Programmdatei
+/dgm-nt.exe
+/app/dist/

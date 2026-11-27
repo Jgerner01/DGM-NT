@@ -498,6 +498,7 @@ pub struct DgmApp {
     show_settings: bool,
     show_help: bool,
     show_about: bool,
+    updater: crate::update::Updater,
     confirm: Option<Confirm>,
     blink: Option<(usize, Instant)>,
     // screenshot mode
@@ -588,6 +589,7 @@ impl DgmApp {
             show_settings: false,
             show_help: false,
             show_about: false,
+            updater: crate::update::Updater::default(),
             confirm: None,
             blink: None,
             screenshot,
@@ -605,6 +607,9 @@ impl DgmApp {
             win_first: None,
             dxfz: DxfZState { replace_zero: true, ..Default::default() },
         };
+        if app.screenshot.is_none() {
+            app.updater.search_quietly(&cc.egui_ctx);
+        }
         // start: a file given on the command line, the last project, else the data folder, else a demo
         if let Some(p) = open {
             app.open_path(&p);
@@ -3413,6 +3418,7 @@ impl DgmApp {
                     self.show_help = true;
                     ui.close();
                 }
+                self.updater.menu_entry(ui);
                 if ui.button("Über DGM-NT").clicked() {
                     self.show_about = true;
                     ui.close();
@@ -4772,10 +4778,12 @@ impl DgmApp {
         if self.show_about {
             let mut open = true;
             egui::Window::new("Über DGM-NT").open(&mut open).show(ctx, |ui| {
+                ui.strong(format!("{} {}", crate::version::PROGRAMM, crate::version::FULL));
                 ui.label("DGM-NT – digitales Geländemodell.\nNeubau des DGMX-Programms mit Vektorgrafik und Autospeichern.\nLiest die Projektdateien GM0, GM1, GM2, GM9 und GMG.");
             });
             self.show_about = open;
         }
+        self.updater.show(ctx);
 
         if let Some(c) = &self.confirm {
             let (title, text) = match c {

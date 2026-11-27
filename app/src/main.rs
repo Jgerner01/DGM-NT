@@ -18,6 +18,8 @@ mod tin;
 mod view;
 mod view3d;
 mod water;
+mod update;
+mod version;
 
 use std::path::PathBuf;
 
